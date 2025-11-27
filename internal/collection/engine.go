@@ -98,11 +98,22 @@ func (e *Engine) UpdateCollection(ctx context.Context, name string, gqlSchema st
 	return ev, nil
 }
 
+// GetCollection возвращает коллекцию по имени с double-check locking
 func (e *Engine) GetCollection(name string) (*Collection, error) {
+	// Первая проверка с read lock
 	e.mu.RLock()
 	col, ok := e.collections[name]
 	e.mu.RUnlock()
 	if ok {
+		return col, nil
+	}
+
+	// Получаем write lock для создания
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Double-check: проверяем ещё раз под write lock
+	if col, ok := e.collections[name]; ok {
 		return col, nil
 	}
 
@@ -117,9 +128,7 @@ func (e *Engine) GetCollection(name string) (*Collection, error) {
 		EventLog:  e.eventLog,
 	})
 
-	e.mu.Lock()
 	e.collections[name] = col
-	e.mu.Unlock()
 
 	return col, nil
 }

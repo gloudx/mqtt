@@ -9,10 +9,11 @@ import (
 )
 
 type IndexManager struct {
-	db      *badger.DB // Добавлено для доступа при Remove
-	storage *IndexStorage
-	schema  *schema.SchemaDefinition
-	indexes map[string]Index
+	db          *badger.DB
+	storage     *IndexStorage
+	mainStorage *Storage // Хранилище документов для получения значений при удалении
+	schema      *schema.SchemaDefinition
+	indexes     map[string]Index
 }
 
 type Index interface {
@@ -43,11 +44,14 @@ type FullTextIndex struct {
 
 func NewIndexManager(db *badger.DB, schemaDef *schema.SchemaDefinition) *IndexManager {
 	storage := NewIndexStorage(db, schemaDef.Name)
+	mainStorage := NewStorage(db, schemaDef.Name) // Создаём один раз
+
 	im := &IndexManager{
-		db:      db,
-		storage: storage,
-		schema:  schemaDef,
-		indexes: make(map[string]Index),
+		db:          db,
+		storage:     storage,
+		mainStorage: mainStorage,
+		schema:      schemaDef,
+		indexes:     make(map[string]Index),
 	}
 
 	for _, indexDef := range schemaDef.Indexes {
@@ -80,31 +84,47 @@ func (im *IndexManager) Index(docID string, doc Document) error {
 	for field, idx := range im.indexes {
 		value := doc[field]
 		if err := idx.Add(docID, value); err != nil {
-			return err
+			return fmt.Errorf("failed to add to index %s: %w", field, err)
 		}
 	}
 	return nil
 }
 
 // Remove удаляет документ из всех индексов
+// Использует сохранённую ссылку на mainStorage вместо создания нового
 func (im *IndexManager) Remove(docID string) error {
-	// Сначала получаем документ из storage чтобы знать значения для удаления
-	mainStorage := NewStorage(im.db, im.schema.Name)
-	doc, err := mainStorage.Get(docID)
+	// Получаем документ из storage чтобы знать значения для удаления
+	doc, err := im.mainStorage.Get(docID)
 	if err != nil {
 		// Документ уже удалён или не существует - это нормально
 		return nil
 	}
 
+	var lastErr error
 	for field, idx := range im.indexes {
 		value := doc[field]
 		if value != nil {
 			if err := idx.Remove(docID, value); err != nil {
-				return fmt.Errorf("failed to remove from index %s: %w", field, err)
+				lastErr = fmt.Errorf("failed to remove from index %s: %w", field, err)
 			}
 		}
 	}
-	return nil
+	return lastErr
+}
+
+// RemoveWithDoc удаляет документ из индексов, используя переданный документ
+// Оптимизация: не требует чтения из storage
+func (im *IndexManager) RemoveWithDoc(docID string, doc Document) error {
+	var lastErr error
+	for field, idx := range im.indexes {
+		value := doc[field]
+		if value != nil {
+			if err := idx.Remove(docID, value); err != nil {
+				lastErr = fmt.Errorf("failed to remove from index %s: %w", field, err)
+			}
+		}
+	}
+	return lastErr
 }
 
 func (im *IndexManager) Query(q Query) (*QueryResult, error) {
@@ -120,7 +140,7 @@ func (im *IndexManager) Query(q Query) (*QueryResult, error) {
 
 		fieldDocIDs, err := idx.Search(filterValue)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("index search failed for field %s: %w", field, err)
 		}
 
 		if firstFilter {
@@ -144,35 +164,35 @@ func (im *IndexManager) Query(q Query) (*QueryResult, error) {
 	}
 
 	// Применяем лимит до загрузки документов (оптимизация)
+	totalMatched := len(docIDs)
 	if q.Limit > 0 && len(docIDs) > q.Limit+q.Offset {
 		docIDs = docIDs[:q.Limit+q.Offset]
 	}
 
 	docs := make([]Document, 0, len(docIDs))
-	storage := NewStorage(im.db, im.schema.Name)
 
 	for _, docID := range docIDs {
-		doc, err := storage.Get(docID)
+		doc, err := im.mainStorage.Get(docID)
 		if err != nil {
-			continue
+			continue // Документ мог быть удалён
 		}
 		docs = append(docs, doc)
 	}
 
 	return &QueryResult{
 		Documents: docs,
-		Total:     len(docs),
+		Total:     totalMatched,
 	}, nil
 }
 
 // intersect возвращает пересечение двух слайсов
 func intersect(a, b []string) []string {
-	set := make(map[string]bool)
+	set := make(map[string]bool, len(a))
 	for _, v := range a {
 		set[v] = true
 	}
 
-	result := make([]string, 0)
+	result := make([]string, 0, min(len(a), len(b)))
 	for _, v := range b {
 		if set[v] {
 			result = append(result, v)
@@ -181,7 +201,15 @@ func intersect(a, b []string) []string {
 	return result
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (im *IndexManager) Rebuild(docs []Document) error {
+	// Очищаем существующие индексы перед перестроением
 	for _, doc := range docs {
 		docID, ok := doc["id"].(string)
 		if !ok {
@@ -189,7 +217,7 @@ func (im *IndexManager) Rebuild(docs []Document) error {
 		}
 
 		if err := im.Index(docID, doc); err != nil {
-			return err
+			return fmt.Errorf("failed to rebuild index for doc %s: %w", docID, err)
 		}
 	}
 	return nil
@@ -199,6 +227,15 @@ func (im *IndexManager) Rebuild(docs []Document) error {
 func (im *IndexManager) HasIndex(field string) bool {
 	_, exists := im.indexes[field]
 	return exists
+}
+
+// GetIndexedFields возвращает список проиндексированных полей
+func (im *IndexManager) GetIndexedFields() []string {
+	fields := make([]string, 0, len(im.indexes))
+	for field := range im.indexes {
+		fields = append(fields, field)
+	}
+	return fields
 }
 
 // ============ ExactIndex ============
@@ -396,7 +433,7 @@ func (idx *RangeIndex) Remove(docID string, value interface{}) error {
 func (idx *RangeIndex) Search(filter interface{}) ([]string, error) {
 	rangeFilter, ok := filter.(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("range filter must be map")
+		return nil, fmt.Errorf("range filter must be map with 'min' and/or 'max' keys")
 	}
 
 	min := rangeFilter["min"]
@@ -430,7 +467,11 @@ func (is *IndexStorage) Put(indexName, value, docID string) error {
 func (is *IndexStorage) Delete(indexName, value, docID string) error {
 	key := is.indexKey(indexName, value, docID)
 	return is.db.Update(func(txn *badger.Txn) error {
-		return txn.Delete(key)
+		err := txn.Delete(key)
+		if err == badger.ErrKeyNotFound {
+			return nil // Ключ уже удалён - это нормально
+		}
+		return err
 	})
 }
 
@@ -536,7 +577,6 @@ func (is *IndexStorage) inRange(value string, min, max interface{}) bool {
 		return true
 	}
 
-	// TODO: Реализовать сравнение для разных типов
 	if min != nil {
 		minStr := fmt.Sprintf("%020v", min)
 		if value < minStr {

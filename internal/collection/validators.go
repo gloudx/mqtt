@@ -12,8 +12,9 @@ import (
 
 // Validator валидирует документы по схеме
 type Validator struct {
-	schema  *schema.SchemaDefinition
-	storage *Storage // Для проверки уникальности
+	schema       *schema.SchemaDefinition
+	storage      *Storage
+	indexManager *IndexManager // Добавлено для оптимизации проверки уникальности
 }
 
 // NewValidator создаёт новый валидатор
@@ -22,6 +23,20 @@ func NewValidator(schemaDef *schema.SchemaDefinition, storage *Storage) *Validat
 		schema:  schemaDef,
 		storage: storage,
 	}
+}
+
+// NewValidatorWithIndex создаёт валидатор с поддержкой индексов для оптимизации
+func NewValidatorWithIndex(schemaDef *schema.SchemaDefinition, storage *Storage, indexManager *IndexManager) *Validator {
+	return &Validator{
+		schema:       schemaDef,
+		storage:      storage,
+		indexManager: indexManager,
+	}
+}
+
+// SetIndexManager устанавливает IndexManager для оптимизации проверки уникальности
+func (v *Validator) SetIndexManager(im *IndexManager) {
+	v.indexManager = im
 }
 
 // ValidationMode режим валидации
@@ -72,7 +87,7 @@ func (v *Validator) ValidateWithMode(doc Document, mode ValidationMode, existing
 			}
 
 			// Проверка уникальности
-			if v.hasDirective(field, "unique") && v.storage != nil {
+			if v.hasDirective(field, "unique") {
 				if err := v.validateUnique(field.Name, val, doc); err != nil {
 					return err
 				}
@@ -302,16 +317,58 @@ func (v *Validator) validatePattern(fieldName string, directive schema.Directive
 	return nil
 }
 
+// validateUnique проверяет уникальность значения поля
+// Оптимизировано: использует индекс если доступен, иначе полный скан
 func (v *Validator) validateUnique(fieldName string, val interface{}, currentDoc Document) error {
+	currentID, _ := currentDoc["id"].(string)
+
+	// Оптимизация: используем индекс если доступен
+	if v.indexManager != nil && v.indexManager.HasIndex(fieldName) {
+		return v.validateUniqueWithIndex(fieldName, val, currentID)
+	}
+
+	// Fallback: полный скан (медленно, но работает без индекса)
+	return v.validateUniqueWithScan(fieldName, val, currentID)
+}
+
+// validateUniqueWithIndex проверяет уникальность через индекс (быстро)
+func (v *Validator) validateUniqueWithIndex(fieldName string, val interface{}, currentID string) error {
+	if v.indexManager == nil {
+		return nil
+	}
+
+	idx, exists := v.indexManager.indexes[fieldName]
+	if !exists {
+		return nil
+	}
+
+	// Ищем документы с таким же значением
+	docIDs, err := idx.Search(val)
+	if err != nil {
+		return fmt.Errorf("failed to search index for uniqueness: %w", err)
+	}
+
+	// Проверяем найденные документы
+	for _, docID := range docIDs {
+		// Пропускаем текущий документ при update
+		if docID == currentID {
+			continue
+		}
+		return fmt.Errorf("field %s must be unique, value %v already exists in document %s", fieldName, val, docID)
+	}
+
+	return nil
+}
+
+// validateUniqueWithScan проверяет уникальность полным сканом (медленно)
+func (v *Validator) validateUniqueWithScan(fieldName string, val interface{}, currentID string) error {
 	if v.storage == nil {
 		return nil
 	}
 
-	currentID, _ := currentDoc["id"].(string)
-
-	// Сканируем все документы для проверки уникальности
-	// TODO: Оптимизировать через индексы
 	var found bool
+	var conflictID string
+
 	err := v.storage.Scan(v.storage.docPrefix(), func(key, value []byte) error {
 		var doc Document
 		if err := json.Unmarshal(value, &doc); err != nil {
@@ -325,6 +382,9 @@ func (v *Validator) validateUnique(fieldName string, val interface{}, currentDoc
 
 		if existingVal, exists := doc[fieldName]; exists && existingVal == val {
 			found = true
+			if docID, ok := doc["id"].(string); ok {
+				conflictID = docID
+			}
 		}
 		return nil
 	})
@@ -334,6 +394,9 @@ func (v *Validator) validateUnique(fieldName string, val interface{}, currentDoc
 	}
 
 	if found {
+		if conflictID != "" {
+			return fmt.Errorf("field %s must be unique, value %v already exists in document %s", fieldName, val, conflictID)
+		}
 		return fmt.Errorf("field %s must be unique, value %v already exists", fieldName, val)
 	}
 

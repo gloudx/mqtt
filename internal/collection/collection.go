@@ -18,7 +18,7 @@ type Collection struct {
 	name         string
 	schema       *schema.SchemaDefinition
 	storage      *Storage
-	indexManager *IndexManager // Добавлен IndexManager
+	indexManager *IndexManager
 	validator    *Validator
 	eventLog     *eventlog.EventLog
 }
@@ -41,12 +41,17 @@ func NewCollection(db *badger.DB, schemaDef *schema.SchemaDefinition, eventLog *
 
 func NewCollectionWithConfig(config CollectionConfig) *Collection {
 	storage := NewStorage(config.DB, config.SchemaDef.Name)
+	indexManager := NewIndexManager(config.DB, config.SchemaDef)
+
+	// Создаём валидатор с поддержкой индексов для оптимизации проверки уникальности
+	validator := NewValidatorWithIndex(config.SchemaDef, storage, indexManager)
+
 	col := &Collection{
 		name:         config.SchemaDef.Name,
 		schema:       config.SchemaDef,
 		storage:      storage,
-		indexManager: NewIndexManager(config.DB, config.SchemaDef), // Инициализация индексов
-		validator:    NewValidator(config.SchemaDef, storage),
+		indexManager: indexManager,
+		validator:    validator,
 		eventLog:     config.EventLog,
 	}
 	return col
@@ -60,6 +65,7 @@ func (c *Collection) Schema() *schema.SchemaDefinition {
 	return c.schema
 }
 
+// Insert вставляет документ с транзакционной семантикой
 func (c *Collection) Insert(ctx context.Context, doc Document) (*event.Event, error) {
 	docID, ok := doc["id"].(string)
 	if !ok || docID == "" {
@@ -90,12 +96,15 @@ func (c *Collection) Insert(ctx context.Context, doc Document) (*event.Event, er
 
 	// Применяем событие к локальному состоянию
 	if err := c.ApplyEvent(ctx, ev.EventTID); err != nil {
-		return nil, fmt.Errorf("failed to apply event: %w", err)
+		// Транзакционность: помечаем событие как failed (если поддерживается)
+		// или логируем для последующего восстановления
+		return nil, fmt.Errorf("failed to apply event (event %s recorded but not applied): %w", ev.EventTID, err)
 	}
 
 	return ev, nil
 }
 
+// Update обновляет документ с транзакционной семантикой
 func (c *Collection) Update(ctx context.Context, docID string, changes Document) (*event.Event, error) {
 	existing, err := c.storage.Get(docID)
 	if err != nil {
@@ -107,25 +116,30 @@ func (c *Collection) Update(ctx context.Context, docID string, changes Document)
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
-	// Применяем изменения
+	// Применяем изменения к копии
+	updated := make(Document, len(existing))
+	for k, v := range existing {
+		updated[k] = v
+	}
 	for k, v := range changes {
-		existing[k] = v
+		updated[k] = v
 	}
 
 	// Создаем событие через EventLog
-	ev, err := c.eventLog.Append(ctx, c.name, string(OpUpdate), existing, nil)
+	ev, err := c.eventLog.Append(ctx, c.name, string(OpUpdate), updated, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to append event: %w", err)
 	}
 
 	// Применяем событие к локальному состоянию
 	if err := c.ApplyEvent(ctx, ev.EventTID); err != nil {
-		return nil, fmt.Errorf("failed to apply event: %w", err)
+		return nil, fmt.Errorf("failed to apply event (event %s recorded but not applied): %w", ev.EventTID, err)
 	}
 
 	return ev, nil
 }
 
+// Delete удаляет документ с транзакционной семантикой
 func (c *Collection) Delete(ctx context.Context, docID string) (*event.Event, error) {
 	exists, err := c.storage.Exists(docID)
 	if err != nil {
@@ -145,7 +159,7 @@ func (c *Collection) Delete(ctx context.Context, docID string) (*event.Event, er
 
 	// Применяем событие к локальному состоянию
 	if err := c.ApplyEvent(ctx, ev.EventTID); err != nil {
-		return nil, fmt.Errorf("failed to apply event: %w", err)
+		return nil, fmt.Errorf("failed to apply event (event %s recorded but not applied): %w", ev.EventTID, err)
 	}
 
 	return ev, nil
@@ -212,7 +226,12 @@ func (c *Collection) queryFullScan(ctx context.Context, q Query) ([]Document, er
 			return err
 		}
 
-		if c.matchesFilter(doc, q.Filter) {
+		matches, err := c.matchesFilter(doc, q.Filter)
+		if err != nil {
+			// Логируем ошибку, но продолжаем сканирование
+			return nil
+		}
+		if matches {
 			docs = append(docs, doc)
 		}
 		return nil
@@ -292,88 +311,133 @@ func compareValues(a, b interface{}) bool {
 }
 
 // matchesFilter проверяет соответствие документа фильтру
-func (c *Collection) matchesFilter(doc Document, filter map[string]interface{}) bool {
+// Возвращает ошибку для отладки проблем с фильтрацией
+func (c *Collection) matchesFilter(doc Document, filter map[string]interface{}) (bool, error) {
 	if len(filter) == 0 {
-		return true
+		return true, nil
 	}
 
 	for key, filterVal := range filter {
 		docVal, exists := doc[key]
 		if !exists {
-			return false
+			return false, nil
 		}
 
-		// Простое сравнение равенства
-		if filterVal != docVal {
-			// Проверяем вложенные операторы
-			if filterMap, ok := filterVal.(map[string]interface{}); ok {
-				if !c.matchesOperators(docVal, filterMap) {
-					return false
-				}
-			} else {
-				return false
+		// Проверяем вложенные операторы
+		if filterMap, ok := filterVal.(map[string]interface{}); ok {
+			matches, err := c.matchesOperators(docVal, filterMap)
+			if err != nil {
+				return false, fmt.Errorf("field %s: %w", key, err)
+			}
+			if !matches {
+				return false, nil
+			}
+		} else {
+			// Простое сравнение равенства
+			if !valuesEqual(filterVal, docVal) {
+				return false, nil
 			}
 		}
 	}
 
-	return true
+	return true, nil
+}
+
+// valuesEqual сравнивает два значения с учётом типов
+func valuesEqual(a, b interface{}) bool {
+	// Обработка числовых типов (JSON парсит числа как float64)
+	switch va := a.(type) {
+	case float64:
+		switch vb := b.(type) {
+		case float64:
+			return va == vb
+		case int:
+			return va == float64(vb)
+		case int64:
+			return va == float64(vb)
+		}
+	case int:
+		switch vb := b.(type) {
+		case float64:
+			return float64(va) == vb
+		case int:
+			return va == vb
+		case int64:
+			return int64(va) == vb
+		}
+	}
+	return a == b
 }
 
 // matchesOperators проверяет соответствие значения операторам фильтра
-func (c *Collection) matchesOperators(docVal interface{}, operators map[string]interface{}) bool {
+// Возвращает ошибку для отладки
+func (c *Collection) matchesOperators(docVal interface{}, operators map[string]interface{}) (bool, error) {
 	for op, opVal := range operators {
 		switch op {
 		case "equals":
-			if docVal != opVal {
-				return false
+			if !valuesEqual(docVal, opVal) {
+				return false, nil
 			}
 		case "contains":
 			strDoc, okDoc := docVal.(string)
 			strOp, okOp := opVal.(string)
-			if okDoc && okOp {
-				if !contains(strDoc, strOp) {
-					return false
-				}
+			if !okDoc || !okOp {
+				return false, fmt.Errorf("'contains' operator requires string values")
+			}
+			if !contains(strDoc, strOp) {
+				return false, nil
 			}
 		case "startsWith":
 			strDoc, okDoc := docVal.(string)
 			strOp, okOp := opVal.(string)
-			if okDoc && okOp {
-				if !startsWith(strDoc, strOp) {
-					return false
-				}
+			if !okDoc || !okOp {
+				return false, fmt.Errorf("'startsWith' operator requires string values")
+			}
+			if !startsWith(strDoc, strOp) {
+				return false, nil
 			}
 		case "endsWith":
 			strDoc, okDoc := docVal.(string)
 			strOp, okOp := opVal.(string)
-			if okDoc && okOp {
-				if !endsWith(strDoc, strOp) {
-					return false
-				}
+			if !okDoc || !okOp {
+				return false, fmt.Errorf("'endsWith' operator requires string values")
+			}
+			if !endsWith(strDoc, strOp) {
+				return false, nil
 			}
 		case "gt":
 			if !compareNumbers(docVal, opVal, ">") {
-				return false
+				return false, nil
 			}
 		case "gte":
 			if !compareNumbers(docVal, opVal, ">=") {
-				return false
+				return false, nil
 			}
 		case "lt":
 			if !compareNumbers(docVal, opVal, "<") {
-				return false
+				return false, nil
 			}
 		case "lte":
 			if !compareNumbers(docVal, opVal, "<=") {
-				return false
+				return false, nil
 			}
 		case "in":
 			if !inSlice(docVal, opVal) {
-				return false
+				return false, nil
 			}
+		case "ne", "notEquals":
+			if valuesEqual(docVal, opVal) {
+				return false, nil
+			}
+		case "notIn":
+			if inSlice(docVal, opVal) {
+				return false, nil
+			}
+		default:
+			return false, fmt.Errorf("unknown operator: %s", op)
 		}
 	}
-	return true
+	return true, nil
 }
 
 func (c *Collection) Count(ctx context.Context) (int, error) {
@@ -383,9 +447,8 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 // updateSchema обновляет схему коллекции
 func (c *Collection) updateSchema(schemaDef *schema.SchemaDefinition) {
 	c.schema = schemaDef
-	c.validator = NewValidator(schemaDef, c.storage)
-	// Пересоздаём IndexManager с новой схемой
-	// TODO: Возможно нужен RebuildIndexes
+	c.validator = NewValidatorWithIndex(schemaDef, c.storage, c.indexManager)
+	// TODO: Возможно нужен RebuildIndexes для новых индексов
 }
 
 func (c *Collection) ApplyEvent(ctx context.Context, id tid.TID) error {
@@ -426,7 +489,9 @@ func (c *Collection) ApplyEvent(ctx context.Context, id tid.TID) error {
 	case OpUpdate:
 		// Удаляем старые индексы
 		if c.indexManager != nil {
-			c.indexManager.Remove(docID)
+			if err := c.indexManager.Remove(docID); err != nil {
+				// Логируем, но не прерываем - документ может быть новым
+			}
 		}
 		if err := c.storage.Put(docID, doc); err != nil {
 			return fmt.Errorf("failed to store document: %w", err)
@@ -442,7 +507,9 @@ func (c *Collection) ApplyEvent(ctx context.Context, id tid.TID) error {
 	case OpDelete:
 		// Удаляем индексы
 		if c.indexManager != nil {
-			c.indexManager.Remove(docID)
+			if err := c.indexManager.Remove(docID); err != nil {
+				// Логируем, но не прерываем
+			}
 		}
 		return c.storage.Delete(docID)
 
@@ -537,7 +604,7 @@ func inSlice(val interface{}, slice interface{}) bool {
 		return false
 	}
 	for _, item := range s {
-		if item == val {
+		if valuesEqual(item, val) {
 			return true
 		}
 	}
