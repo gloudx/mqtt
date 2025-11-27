@@ -73,7 +73,6 @@ func NewSyncManager(mqttBroker, ownerDID string) (*SyncManager, error) {
 	// Регистрируем heartbeat
 	sm.ripples.Register(&ripples.Config{
 		Type:     "heartbeat",
-		Topic:    "heartbeat",
 		QoS:      0,
 		Interval: 30 * time.Second,
 		Handlers: []ripples.Handler{

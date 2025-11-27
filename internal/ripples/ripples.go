@@ -30,7 +30,6 @@ type Publisher func(ctx context.Context) (*Envelope, error)
 // Config конфигурация для одного типа ripple
 type Config struct {
 	Type      string        // Тип сообщения
-	// Topic     string        // MQTT топик (можно с wildcards для subscription)
 	Handlers  []Handler     // Обработчик входящих сообщений
 	Publisher Publisher     // Функция генерации исходящих сообщений (опционально)
 	Interval  time.Duration // Интервал публикации (0 = не публиковать)
@@ -101,7 +100,7 @@ func (r *Ripples) Register(cfg *Config) error {
 	}
 
 	if len(cfg.Handlers) > 0 {
-		topic := fmt.Sprintf("%s/%s", r.prefix, cfg.Topic)
+		topic := fmt.Sprintf("%s/%s", r.prefix, cfg.Type)
 		token := r.mqtt.Subscribe(topic, cfg.QoS, r.makeMessageHandler(cfg))
 		if token.Wait() && token.Error() != nil {
 			return fmt.Errorf("subscribe failed: %w", token.Error())
@@ -202,7 +201,7 @@ func (r *Ripples) publish(cfg *Config) {
 		r.logger.Error().Err(err).Str("type", cfg.Type).Msg("Failed to marshal envelope")
 		return
 	}
-	topic := fmt.Sprintf("%s/%s", r.prefix, cfg.Topic)
+	topic := fmt.Sprintf("%s/%s", r.prefix, cfg.Type)
 	token := r.mqtt.Publish(topic, cfg.QoS, false, data)
 	if token.Wait() && token.Error() != nil {
 		r.logger.Error().Err(token.Error()).Str("type", cfg.Type).Str("topic", topic).Msg("Failed to publish")

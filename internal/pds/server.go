@@ -11,6 +11,7 @@ import (
 	"mqtt-http-tunnel/internal/graphql"
 	"mqtt-http-tunnel/internal/identity"
 	"mqtt-http-tunnel/internal/schema"
+	"mqtt-http-tunnel/internal/synchronizer"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -30,7 +31,7 @@ type Server struct {
 	keyPair    *identity.KeyPair
 	// keyManager   *keymanager.KeyManager
 	eventLog     *eventlog.EventLog
-	synchronizer *eventlog.MQTTSynchronizer
+	synchronizer *synchronizer.MQTTSynchronizer
 }
 
 func NewServer(config *Config) (*Server, error) {
@@ -138,7 +139,7 @@ func (s *Server) initSynchronizer() error {
 	if clientID == "" {
 		clientID = fmt.Sprintf("pds-%s", s.ownerDID.String()[:16])
 	}
-	config := eventlog.MQTTConfig{
+	config := synchronizer.MQTTConfig{
 		Broker:       s.config.MQTTConfig.Broker,
 		ClientID:     clientID,
 		Username:     s.config.MQTTConfig.Username,
@@ -149,7 +150,7 @@ func (s *Server) initSynchronizer() error {
 		KeyPair:      s.keyPair,
 		// KeyManager:   s.keyManager,
 	}
-	sync, err := eventlog.NewMQTTSynchronizer(s.ownerDID, config)
+	sync, err := synchronizer.NewMQTTSynchronizer(s.ownerDID, config)
 	if err != nil {
 		return fmt.Errorf("create MQTT synchronizer: %w", err)
 	}
@@ -164,7 +165,7 @@ func (s *Server) initEngine() error {
 		return err
 	}
 	storage := eventlog.NewBadgerStorage(s.db, "eventlog:system")
-	var synchronizer eventlog.Synchronizer
+	var synchronizer synchronizer.Synchronizer
 	if s.synchronizer != nil {
 		synchronizer = s.synchronizer
 	}

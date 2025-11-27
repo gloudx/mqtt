@@ -9,6 +9,7 @@ import (
 )
 
 type IndexManager struct {
+	db      *badger.DB // Добавлено для доступа при Remove
 	storage *IndexStorage
 	schema  *schema.SchemaDefinition
 	indexes map[string]Index
@@ -43,6 +44,7 @@ type FullTextIndex struct {
 func NewIndexManager(db *badger.DB, schemaDef *schema.SchemaDefinition) *IndexManager {
 	storage := NewIndexStorage(db, schemaDef.Name)
 	im := &IndexManager{
+		db:      db,
 		storage: storage,
 		schema:  schemaDef,
 		indexes: make(map[string]Index),
@@ -84,34 +86,70 @@ func (im *IndexManager) Index(docID string, doc Document) error {
 	return nil
 }
 
+// Remove удаляет документ из всех индексов
 func (im *IndexManager) Remove(docID string) error {
+	// Сначала получаем документ из storage чтобы знать значения для удаления
+	mainStorage := NewStorage(im.db, im.schema.Name)
+	doc, err := mainStorage.Get(docID)
+	if err != nil {
+		// Документ уже удалён или не существует - это нормально
+		return nil
+	}
+
+	for field, idx := range im.indexes {
+		value := doc[field]
+		if value != nil {
+			if err := idx.Remove(docID, value); err != nil {
+				return fmt.Errorf("failed to remove from index %s: %w", field, err)
+			}
+		}
+	}
 	return nil
 }
 
 func (im *IndexManager) Query(q Query) (*QueryResult, error) {
 	var docIDs []string
-	var err error
+	firstFilter := true
 
+	// Пересекаем результаты по всем фильтрам
 	for field, filterValue := range q.Filter {
 		idx, exists := im.indexes[field]
 		if !exists {
 			return nil, fmt.Errorf("no index on field %s", field)
 		}
 
-		docIDs, err = idx.Search(filterValue)
+		fieldDocIDs, err := idx.Search(filterValue)
 		if err != nil {
 			return nil, err
 		}
 
-		break
+		if firstFilter {
+			docIDs = fieldDocIDs
+			firstFilter = false
+		} else {
+			// Пересечение множеств
+			docIDs = intersect(docIDs, fieldDocIDs)
+		}
+
+		if len(docIDs) == 0 {
+			break // Нет смысла продолжать
+		}
 	}
 
-	if q.Limit > 0 && len(docIDs) > q.Limit {
-		docIDs = docIDs[:q.Limit]
+	if len(docIDs) == 0 {
+		return &QueryResult{
+			Documents: []Document{},
+			Total:     0,
+		}, nil
+	}
+
+	// Применяем лимит до загрузки документов (оптимизация)
+	if q.Limit > 0 && len(docIDs) > q.Limit+q.Offset {
+		docIDs = docIDs[:q.Limit+q.Offset]
 	}
 
 	docs := make([]Document, 0, len(docIDs))
-	storage := NewStorage(im.storage.db, im.schema.Name)
+	storage := NewStorage(im.db, im.schema.Name)
 
 	for _, docID := range docIDs {
 		doc, err := storage.Get(docID)
@@ -127,6 +165,22 @@ func (im *IndexManager) Query(q Query) (*QueryResult, error) {
 	}, nil
 }
 
+// intersect возвращает пересечение двух слайсов
+func intersect(a, b []string) []string {
+	set := make(map[string]bool)
+	for _, v := range a {
+		set[v] = true
+	}
+
+	result := make([]string, 0)
+	for _, v := range b {
+		if set[v] {
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
 func (im *IndexManager) Rebuild(docs []Document) error {
 	for _, doc := range docs {
 		docID, ok := doc["id"].(string)
@@ -140,6 +194,14 @@ func (im *IndexManager) Rebuild(docs []Document) error {
 	}
 	return nil
 }
+
+// HasIndex проверяет наличие индекса для поля
+func (im *IndexManager) HasIndex(field string) bool {
+	_, exists := im.indexes[field]
+	return exists
+}
+
+// ============ ExactIndex ============
 
 func NewExactIndex(storage *IndexStorage, field string) *ExactIndex {
 	return &ExactIndex{
@@ -174,6 +236,8 @@ func (idx *ExactIndex) Search(filter interface{}) ([]string, error) {
 	prefix := idx.storage.indexPrefix(indexName, strValue)
 	return idx.storage.Scan(prefix)
 }
+
+// ============ FullTextIndex ============
 
 func NewFullTextIndex(storage *IndexStorage, field string) *FullTextIndex {
 	return &FullTextIndex{
@@ -264,6 +328,8 @@ func (idx *FullTextIndex) tokenize(text string) []string {
 	return tokens
 }
 
+// ============ PrefixIndex ============
+
 func NewPrefixIndex(storage *IndexStorage, field string) *PrefixIndex {
 	return &PrefixIndex{
 		storage: storage,
@@ -297,6 +363,8 @@ func (idx *PrefixIndex) Search(filter interface{}) ([]string, error) {
 	prefix := idx.storage.indexPrefix(indexName, prefixValue)
 	return idx.storage.Scan(prefix)
 }
+
+// ============ RangeIndex ============
 
 func NewRangeIndex(storage *IndexStorage, field string) *RangeIndex {
 	return &RangeIndex{
@@ -337,6 +405,8 @@ func (idx *RangeIndex) Search(filter interface{}) ([]string, error) {
 	indexName := fmt.Sprintf("range:%s", idx.field)
 	return idx.storage.ScanRange(indexName, idx.field, min, max)
 }
+
+// ============ IndexStorage ============
 
 type IndexStorage struct {
 	db             *badger.DB
@@ -464,6 +534,21 @@ func (is *IndexStorage) extractRangeValue(key []byte) string {
 func (is *IndexStorage) inRange(value string, min, max interface{}) bool {
 	if min == nil && max == nil {
 		return true
+	}
+
+	// TODO: Реализовать сравнение для разных типов
+	if min != nil {
+		minStr := fmt.Sprintf("%020v", min)
+		if value < minStr {
+			return false
+		}
+	}
+
+	if max != nil {
+		maxStr := fmt.Sprintf("%020v", max)
+		if value > maxStr {
+			return false
+		}
 	}
 
 	return true

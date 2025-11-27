@@ -9,16 +9,18 @@ import (
 	"mqtt-http-tunnel/internal/eventlog"
 	"mqtt-http-tunnel/internal/schema"
 	"mqtt-http-tunnel/internal/tid"
+	"sort"
 
 	"github.com/dgraph-io/badger/v4"
 )
 
 type Collection struct {
-	name      string
-	schema    *schema.SchemaDefinition
-	storage   *Storage
-	validator *Validator              // Добавлен валидатор
-	eventLog  *eventlog.EventLog
+	name         string
+	schema       *schema.SchemaDefinition
+	storage      *Storage
+	indexManager *IndexManager // Добавлен IndexManager
+	validator    *Validator
+	eventLog     *eventlog.EventLog
 }
 
 type Document map[string]any
@@ -40,11 +42,12 @@ func NewCollection(db *badger.DB, schemaDef *schema.SchemaDefinition, eventLog *
 func NewCollectionWithConfig(config CollectionConfig) *Collection {
 	storage := NewStorage(config.DB, config.SchemaDef.Name)
 	col := &Collection{
-		name:      config.SchemaDef.Name,
-		schema:    config.SchemaDef,
-		storage:   storage,
-		validator: NewValidator(config.SchemaDef, storage), // Инициализация валидатора
-		eventLog:  config.EventLog,
+		name:         config.SchemaDef.Name,
+		schema:       config.SchemaDef,
+		storage:      storage,
+		indexManager: NewIndexManager(config.DB, config.SchemaDef), // Инициализация индексов
+		validator:    NewValidator(config.SchemaDef, storage),
+		eventLog:     config.EventLog,
 	}
 	return col
 }
@@ -168,6 +171,38 @@ type QueryResult struct {
 }
 
 func (c *Collection) Query(ctx context.Context, q Query) (*QueryResult, error) {
+	var docs []Document
+	var err error
+
+	// Пробуем использовать индексы
+	if c.indexManager != nil && len(q.Filter) > 0 {
+		docs, err = c.queryWithIndex(ctx, q)
+		if err == nil {
+			return c.applyPaginationAndSort(docs, q)
+		}
+		// Если индекс не найден - fallback на полный скан
+	}
+
+	// Полный скан с фильтрацией
+	docs, err = c.queryFullScan(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.applyPaginationAndSort(docs, q)
+}
+
+// queryWithIndex использует индексы для запроса
+func (c *Collection) queryWithIndex(ctx context.Context, q Query) ([]Document, error) {
+	result, err := c.indexManager.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	return result.Documents, nil
+}
+
+// queryFullScan выполняет полный скан с фильтрацией
+func (c *Collection) queryFullScan(ctx context.Context, q Query) ([]Document, error) {
 	docs := make([]Document, 0)
 	prefix := c.storage.docPrefix()
 
@@ -177,7 +212,6 @@ func (c *Collection) Query(ctx context.Context, q Query) (*QueryResult, error) {
 			return err
 		}
 
-		// Применяем фильтры
 		if c.matchesFilter(doc, q.Filter) {
 			docs = append(docs, doc)
 		}
@@ -188,9 +222,17 @@ func (c *Collection) Query(ctx context.Context, q Query) (*QueryResult, error) {
 		return nil, fmt.Errorf("scan failed: %w", err)
 	}
 
+	return docs, nil
+}
+
+// applyPaginationAndSort применяет сортировку и пагинацию
+func (c *Collection) applyPaginationAndSort(docs []Document, q Query) (*QueryResult, error) {
 	total := len(docs)
 
-	// TODO: Реализовать сортировку по q.OrderBy и q.Desc
+	// Сортировка
+	if q.OrderBy != "" {
+		c.sortDocuments(docs, q.OrderBy, q.Desc)
+	}
 
 	// Пагинация
 	if q.Offset > 0 {
@@ -211,6 +253,44 @@ func (c *Collection) Query(ctx context.Context, q Query) (*QueryResult, error) {
 	}, nil
 }
 
+// sortDocuments сортирует документы по полю
+func (c *Collection) sortDocuments(docs []Document, field string, desc bool) {
+	sort.Slice(docs, func(i, j int) bool {
+		vi := docs[i][field]
+		vj := docs[j][field]
+
+		less := compareValues(vi, vj)
+		if desc {
+			return !less
+		}
+		return less
+	})
+}
+
+// compareValues сравнивает два значения для сортировки
+func compareValues(a, b interface{}) bool {
+	switch va := a.(type) {
+	case string:
+		if vb, ok := b.(string); ok {
+			return va < vb
+		}
+	case float64:
+		if vb, ok := b.(float64); ok {
+			return va < vb
+		}
+	case int:
+		if vb, ok := b.(int); ok {
+			return va < vb
+		}
+	case bool:
+		if vb, ok := b.(bool); ok {
+			return !va && vb // false < true
+		}
+	}
+	// Для несравнимых типов - по строковому представлению
+	return fmt.Sprintf("%v", a) < fmt.Sprintf("%v", b)
+}
+
 // matchesFilter проверяет соответствие документа фильтру
 func (c *Collection) matchesFilter(doc Document, filter map[string]interface{}) bool {
 	if len(filter) == 0 {
@@ -224,7 +304,6 @@ func (c *Collection) matchesFilter(doc Document, filter map[string]interface{}) 
 		}
 
 		// Простое сравнение равенства
-		// TODO: Поддержка операторов (gt, lt, contains и т.д.)
 		if filterVal != docVal {
 			// Проверяем вложенные операторы
 			if filterMap, ok := filterVal.(map[string]interface{}); ok {
@@ -304,7 +383,9 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 // updateSchema обновляет схему коллекции
 func (c *Collection) updateSchema(schemaDef *schema.SchemaDefinition) {
 	c.schema = schemaDef
-	c.validator = NewValidator(schemaDef, c.storage) // Пересоздаём валидатор
+	c.validator = NewValidator(schemaDef, c.storage)
+	// Пересоздаём IndexManager с новой схемой
+	// TODO: Возможно нужен RebuildIndexes
 }
 
 func (c *Collection) ApplyEvent(ctx context.Context, id tid.TID) error {
@@ -330,16 +411,69 @@ func (c *Collection) ApplyEvent(ctx context.Context, id tid.TID) error {
 
 	op := Operation(ev.EventType)
 	switch op {
-	case OpCreate, OpUpdate:
+	case OpCreate:
 		if err := c.storage.Put(docID, doc); err != nil {
 			return fmt.Errorf("failed to store document: %w", err)
 		}
+		// Обновляем индексы
+		if c.indexManager != nil {
+			if err := c.indexManager.Index(docID, doc); err != nil {
+				return fmt.Errorf("failed to index document: %w", err)
+			}
+		}
 		return nil
+
+	case OpUpdate:
+		// Удаляем старые индексы
+		if c.indexManager != nil {
+			c.indexManager.Remove(docID)
+		}
+		if err := c.storage.Put(docID, doc); err != nil {
+			return fmt.Errorf("failed to store document: %w", err)
+		}
+		// Добавляем новые индексы
+		if c.indexManager != nil {
+			if err := c.indexManager.Index(docID, doc); err != nil {
+				return fmt.Errorf("failed to index document: %w", err)
+			}
+		}
+		return nil
+
 	case OpDelete:
+		// Удаляем индексы
+		if c.indexManager != nil {
+			c.indexManager.Remove(docID)
+		}
 		return c.storage.Delete(docID)
+
 	default:
 		return fmt.Errorf("unknown operation: %s", op)
 	}
+}
+
+// RebuildIndexes перестраивает все индексы
+func (c *Collection) RebuildIndexes(ctx context.Context) error {
+	if c.indexManager == nil {
+		return nil
+	}
+
+	docs := make([]Document, 0)
+	prefix := c.storage.docPrefix()
+
+	err := c.storage.Scan(prefix, func(key, value []byte) error {
+		var doc Document
+		if err := json.Unmarshal(value, &doc); err != nil {
+			return err
+		}
+		docs = append(docs, doc)
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to scan documents: %w", err)
+	}
+
+	return c.indexManager.Rebuild(docs)
 }
 
 // Вспомогательные функции для фильтрации

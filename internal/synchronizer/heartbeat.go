@@ -29,7 +29,7 @@ func (ms *MQTTSynchronizer) handleHeartbeat(client mqtt.Client, msg mqtt.Message
 	}
 
 	ms.peersMu.Lock()
-	peerEntry := &peerInfo{
+	peerEntry := &PeerInfo{
 		DID:      did,
 		LastSeen: time.Now(),
 	}
