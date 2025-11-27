@@ -9,31 +9,40 @@ import (
 	"mqtt-http-tunnel/internal/eventlog"
 	"mqtt-http-tunnel/internal/identity"
 	"mqtt-http-tunnel/internal/schema"
+	"mqtt-http-tunnel/internal/tid"
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
 )
 
+type Operation string
+
+const (
+	OpCreate       Operation = "create"
+	OpUpdate       Operation = "update"
+	OpDelete       Operation = "delete"
+	OpCreateSchema Operation = "create_schema" // Создание новой схемы/коллекции
+	OpUpdateSchema Operation = "update_schema" // Обновление схемы коллекции
+)
+
 type Engine struct {
-	db           *badger.DB
-	registry     *schema.Registry
-	collections  map[string]*Collection
-	ownerDID     *identity.DID
-	keyPair      *identity.KeyPair
-	eventLog     *eventlog.EventLog // Единый EventLog для всей системы
-	synchronizer eventlog.Synchronizer
-	clockID      uint16
-	mu           sync.RWMutex
+	db          *badger.DB
+	registry    *schema.Registry
+	collections map[string]*Collection
+	ownerDID    *identity.DID
+	keyPair     *identity.KeyPair
+	eventLog    *eventlog.EventLog
+	clockID     uint16
+	mu          sync.RWMutex
 }
 
 type EngineConfig struct {
-	DB           *badger.DB
-	OwnerDID     *identity.DID
-	KeyPair      *identity.KeyPair
-	Registry     *schema.Registry
-	EventLog     *eventlog.EventLog // Единый EventLog системы
-	Synchronizer eventlog.Synchronizer
-	ClockID      uint16
+	DB       *badger.DB
+	OwnerDID *identity.DID
+	KeyPair  *identity.KeyPair
+	Registry *schema.Registry
+	EventLog *eventlog.EventLog // Единый EventLog системы
+	ClockID  uint16
 }
 
 func NewEngine(db *badger.DB, ownerDID *identity.DID, keyPair *identity.KeyPair, registry *schema.Registry, eventLog *eventlog.EventLog) *Engine {
@@ -49,80 +58,44 @@ func NewEngine(db *badger.DB, ownerDID *identity.DID, keyPair *identity.KeyPair,
 
 func NewEngineWithConfig(config EngineConfig) *Engine {
 	eng := &Engine{
-		db:           config.DB,
-		registry:     config.Registry,
-		collections:  make(map[string]*Collection),
-		ownerDID:     config.OwnerDID,
-		keyPair:      config.KeyPair,
-		eventLog:     config.EventLog, // Используем общий EventLog
-		synchronizer: config.Synchronizer,
-		clockID:      config.ClockID,
+		db:          config.DB,
+		registry:    config.Registry,
+		collections: make(map[string]*Collection),
+		ownerDID:    config.OwnerDID,
+		keyPair:     config.KeyPair,
+		eventLog:    config.EventLog,
+		clockID:     config.ClockID,
 	}
 	return eng
 }
 
-func (e *Engine) HandleRemoteEvent(ev *event.Event) error {
-	if ev.Collection == "_schemas" {
-		return e.handleRemoteSchemaEvent(ev)
+func (e *Engine) CreateCollection(ctx context.Context, gqlSchema string) (*event.Event, error) {
+	eventData := map[string]any{
+		"schema": gqlSchema,
 	}
-	col, err := e.GetCollection(ev.Collection)
+	ev, err := e.eventLog.Append(ctx, "sys_schemas", string(OpCreateSchema), eventData, nil)
 	if err != nil {
-		return fmt.Errorf("get collection %s: %w", ev.Collection, err)
+		return nil, fmt.Errorf("append schema event: %w", err)
 	}
-	return col.handleRemoteEvent(ev)
-}
-
-func (e *Engine) CreateCollection(ctx context.Context, gqlSchema string) (*Collection, error) {
-	schemaDef, err := e.registry.Create(ctx, gqlSchema)
-	if err != nil {
+	if err := e.ApplyEvent(ctx, ev.EventTID); err != nil {
 		return nil, err
 	}
-	if e.eventLog != nil {
-		schemaData := map[string]any{
-			"operation": OpCreateSchema,
-			"schema":    gqlSchema,
-			"name":      schemaDef.Name,
-		}
-		if _, err := e.eventLog.Append(ctx, "_schemas", string(OpCreateSchema), schemaData, nil); err != nil {
-			return nil, fmt.Errorf("append schema event: %w", err)
-		}
-	}
-	col := e.createCollectionInstance(schemaDef)
-	e.mu.Lock()
-	e.collections[schemaDef.Name] = col
-	e.mu.Unlock()
-	return col, nil
+	return ev, nil
 }
 
-func (e *Engine) UpdateCollection(ctx context.Context, name string, gqlSchema string) (*Collection, error) {
-	schemaDef, err := e.registry.Update(ctx, name, gqlSchema)
+func (e *Engine) UpdateCollection(ctx context.Context, name string, gqlSchema string) (*event.Event, error) {
+	eventData := map[string]any{
+		"name":   name,
+		"schema": gqlSchema,
+	}
+	ev, err := e.eventLog.Append(ctx, "sys_schemas", string(OpUpdateSchema), eventData, nil)
 	if err != nil {
+		return nil, fmt.Errorf("append schema update event: %w", err)
+	}
+	if err := e.ApplyEvent(ctx, ev.EventTID); err != nil {
 		return nil, err
 	}
-	if e.eventLog != nil {
-		schemaData := map[string]any{
-			"operation": OpUpdateSchema,
-			"schema":    gqlSchema,
-			"name":      schemaDef.Name,
-			"version":   schemaDef.Version,
-		}
-		if _, err := e.eventLog.Append(ctx, "_schemas", string(OpUpdateSchema), schemaData, nil); err != nil {
-			return nil, fmt.Errorf("append schema update event: %w", err)
-		}
-	}
-	// Обновляем коллекцию в памяти
-	e.mu.Lock()
-	if existingCol, ok := e.collections[name]; ok {
-		// Обновляем схему в существующей коллекции
-		existingCol.updateSchema(schemaDef)
-		e.mu.Unlock()
-		return existingCol, nil
-	}
-	// Если коллекции не было в памяти, создаем новую
-	col := e.createCollectionInstance(schemaDef)
-	e.collections[name] = col
-	e.mu.Unlock()
-	return col, nil
+	return ev, nil
 }
 
 func (e *Engine) GetCollection(name string) (*Collection, error) {
@@ -136,7 +109,11 @@ func (e *Engine) GetCollection(name string) (*Collection, error) {
 	if !ok {
 		return nil, fmt.Errorf("collection %s not found", name)
 	}
-	col = e.createCollectionInstance(schemaDef)
+	col = NewCollectionWithConfig(CollectionConfig{
+		DB:        e.db,
+		SchemaDef: schemaDef,
+		EventLog:  e.eventLog,
+	})
 	e.mu.Lock()
 	e.collections[name] = col
 	e.mu.Unlock()
@@ -158,76 +135,83 @@ func (e *Engine) LoadAll(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, schemaDef := range schemas {
-		col := e.createCollectionInstance(schemaDef)
+		col := NewCollectionWithConfig(CollectionConfig{
+			DB:        e.db,
+			SchemaDef: schemaDef,
+			EventLog:  e.eventLog,
+		})
 		e.collections[schemaDef.Name] = col
 	}
 	return nil
 }
 
-func (e *Engine) createCollectionInstance(schemaDef *schema.SchemaDefinition) *Collection {
-	return NewCollectionWithConfig(CollectionConfig{
-		DB:        e.db,
-		SchemaDef: schemaDef,
-		EventLog:  e.eventLog, // Передаем общий EventLog
-	})
-}
-
-func (e *Engine) handleRemoteSchemaEvent(ev *event.Event) error {
+func (e *Engine) ApplyEvent(ctx context.Context, id tid.TID) error {
+	ev, err := e.eventLog.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if ev.Collection != "sys_schemas" {
+		col, err := e.GetCollection(ev.Collection)
+		if err != nil {
+			return err
+		}
+		return col.ApplyEvent(ctx, id)
+	}
 	var data map[string]any
 	if err := json.Unmarshal(ev.Payload, &data); err != nil {
 		return fmt.Errorf("unmarshal schema event: %w", err)
 	}
-	op, _ := data["operation"].(string)
-	switch Operation(op) {
+	op := Operation(ev.EventType)
+	switch op {
 	case OpCreateSchema:
-		return e.handleRemoteSchemaCreate(data)
+		return e.schemaCreate(ctx, data)
 	case OpUpdateSchema:
-		return e.handleRemoteSchemaUpdate(data)
+		return e.schemaUpdate(ctx, data)
 	default:
 		return nil
 	}
 }
 
-func (e *Engine) handleRemoteSchemaCreate(data map[string]any) error {
-	gqlSchema, _ := data["schema"].(string)
-	name, _ := data["name"].(string)
-	if gqlSchema == "" || name == "" {
+func (e *Engine) schemaCreate(ctx context.Context, data map[string]any) error {
+	gqlSchema, ok := data["schema"].(string)
+	if !ok {
 		return fmt.Errorf("invalid schema event data")
 	}
+	schemaDef, err := e.registry.Create(ctx, gqlSchema)
+	if err != nil {
+		return fmt.Errorf("create schema from event: %w", err)
+	}
+	if _, exists := e.collections[schemaDef.Name]; exists {
+		return nil
+	}
+	col := NewCollectionWithConfig(CollectionConfig{
+		DB:        e.db,
+		SchemaDef: schemaDef,
+		EventLog:  e.eventLog,
+	})
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, exists := e.collections[name]; exists {
-		return nil // Уже создана
-	}
-	schemaDef, err := e.registry.Create(context.Background(), gqlSchema)
-	if err != nil {
-		if existingSchema, ok := e.registry.Get(name); ok {
-			schemaDef = existingSchema
-		} else {
-			return fmt.Errorf("create schema from remote event: %w", err)
-		}
-	}
-	col := e.createCollectionInstance(schemaDef)
-	e.collections[name] = col
-	fmt.Printf("Created collection %s from remote event\n", name)
+	e.collections[schemaDef.Name] = col
 	return nil
 }
 
-func (e *Engine) handleRemoteSchemaUpdate(data map[string]interface{}) error {
-	gqlSchema, _ := data["schema"].(string)
-	name, _ := data["name"].(string)
-	if gqlSchema == "" || name == "" {
+func (e *Engine) schemaUpdate(ctx context.Context, data map[string]any) error {
+	gqlSchema, ok := data["schema"].(string)
+	if !ok {
 		return fmt.Errorf("invalid schema update event data")
+	}
+	name, ok := data["name"].(string)
+	if !ok {
+		return fmt.Errorf("invalid schema update event data: missing name")
+	}
+	schemaDef, err := e.registry.Update(ctx, name, gqlSchema)
+	if err != nil {
+		return fmt.Errorf("update schema from event: %w", err)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	schemaDef, err := e.registry.Update(context.Background(), name, gqlSchema)
-	if err != nil {
-		return fmt.Errorf("update schema from remote event: %w", err)
-	}
 	if col, exists := e.collections[name]; exists {
 		col.updateSchema(schemaDef)
-		fmt.Printf("Updated collection %s schema to version %d from remote event\n", name, schemaDef.Version)
 	}
 	return nil
 }

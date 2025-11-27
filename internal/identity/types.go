@@ -5,12 +5,10 @@ import (
 	"time"
 )
 
-// DIDMethod определяет метод DID
 type DIDMethod string
 
 const (
-	DIDMethodKey  DIDMethod = "key"
-	DIDMethodPeer DIDMethod = "peer"
+	DIDMethodKey DIDMethod = "key"
 )
 
 type DID struct {
@@ -18,7 +16,8 @@ type DID struct {
 	Identifier string    `json:"method_id"`
 	Fragment   string    `json:"fragment,omitempty"`
 	Query      string    `json:"query,omitempty"`
-	fullDID    string
+	//
+	fullDID string
 }
 
 func (d *DID) String() string {
@@ -73,24 +72,7 @@ type DIDProof struct {
 	ProofValue         string    `json:"proofValue"`
 }
 
-type IdentityManager struct {
-	keyPair   *KeyPair
-	did       *DID
-	didDoc    *DIDDocument
-	storePath string      // Путь для сохранения данных
-	resolver  DIDResolver // Резолвер для внешних DID
-}
-
 // DIDResolver интерфейс для резолюции внешних DID
 type DIDResolver interface {
 	Resolve(didString string) (*DIDDocument, error)
-}
-
-// PersistedIdentity структура для сохранения в файл
-type PersistedIdentity struct {
-	DID           *DID         `json:"did"`
-	DIDDocument   *DIDDocument `json:"did_document"`
-	PrivateKeyRaw []byte       `json:"private_key_raw"`
-	PublicKeyRaw  []byte       `json:"public_key_raw"`
-	LastUpdated   time.Time    `json:"last_updated"`
 }

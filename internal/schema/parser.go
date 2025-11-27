@@ -50,6 +50,7 @@ func (p *Parser) Parse(gqlSchema string) (*SchemaDefinition, error) {
 		Fields:           []FieldDef{},
 		Indexes:          []IndexDef{},
 		SchemaDirectives: p.parseDirectives(mainType.Directives),
+		PrivacyConfig:    p.parseEncryptionConfig(mainType.Directives),
 		//
 		GraphQLSchema: gqlSchema,
 	}
@@ -85,6 +86,8 @@ directive @ttl(seconds: Int!) on FIELD_DEFINITION
 directive @encrypted on FIELD_DEFINITION
 directive @immutable on FIELD_DEFINITION
 directive @permission(roles: [String!]!) on FIELD_DEFINITION | OBJECT
+directive @encryption(type: String!, keyId: String, participants: [String!], encryptFields: [String!], allowRecipientOverride: Boolean) on OBJECT
+directive @accessControl(visibility: String!, sharedWith: [String!]) on OBJECT
 
 `
 	return directives + "\n" + schema
@@ -182,6 +185,58 @@ func (p *Parser) parseDirectives(directives ast.DirectiveList) []DirectiveConfig
 	}
 
 	return result
+}
+
+// parseEncryptionConfig извлекает конфигурацию шифрования из директивы @encryption
+func (p *Parser) parseEncryptionConfig(directives ast.DirectiveList) *PrivacyConfig {
+	for _, directive := range directives {
+		if directive.Name == "encryption" {
+			config := &PrivacyConfig{}
+
+			// Parse encryption type (required)
+			if arg := p.getDirectiveArg(directive, "type"); arg != nil {
+				encType := strings.ToLower(p.argValueToString(arg))
+				config.Type = CollectionEncryptionType(encType)
+			}
+
+			// Parse keyId (optional)
+			if arg := p.getDirectiveArg(directive, "keyId"); arg != nil {
+				config.KeyID = p.argValueToString(arg)
+			}
+
+			// Parse participants (optional)
+			if arg := p.getDirectiveArg(directive, "participants"); arg != nil {
+				if participants, ok := p.argValueToInterface(arg.Value).([]interface{}); ok {
+					for _, p := range participants {
+						if did, ok := p.(string); ok {
+							config.Participants = append(config.Participants, did)
+						}
+					}
+				}
+			}
+
+			// Parse encryptFields (optional)
+			if arg := p.getDirectiveArg(directive, "encryptFields"); arg != nil {
+				if fields, ok := p.argValueToInterface(arg.Value).([]interface{}); ok {
+					for _, f := range fields {
+						if field, ok := f.(string); ok {
+							config.EncryptFields = append(config.EncryptFields, field)
+						}
+					}
+				}
+			}
+
+			// Parse allowRecipientOverride (optional)
+			if arg := p.getDirectiveArg(directive, "allowRecipientOverride"); arg != nil {
+				if override, ok := p.argValueToInterface(arg.Value).(bool); ok {
+					config.AllowRecipientOverride = override
+				}
+			}
+
+			return config
+		}
+	}
+	return nil
 }
 
 func (p *Parser) getDirectiveArg(directive *ast.Directive, name string) *ast.Argument {

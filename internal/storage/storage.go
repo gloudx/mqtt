@@ -1,4 +1,4 @@
-package eventlog
+package storage
 
 import (
 	"context"
@@ -11,6 +11,21 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 )
+
+// Storage интерфейс для персистентности событий
+type Storage interface {
+	Store(ctx context.Context, event *event.Event) error                         // Store сохраняет событие
+	Load(ctx context.Context, id tid.TID) (*event.Event, error)                  // Load загружает событие по ID
+	LoadRange(ctx context.Context, start, end time.Time) ([]*event.Event, error) // LoadRange загружает события в диапазоне
+	LoadByDID(ctx context.Context, did *identity.DID) ([]*event.Event, error)    // LoadByDID загружает все события узла по DID
+	LoadAll(ctx context.Context) ([]*event.Event, error)                         // LoadAll загружает все события
+	LoadFrom(ctx context.Context, from tid.TID) ([]*event.Event, error)          // LoadFrom загружает события, начиная с указанного TID
+	Delete(ctx context.Context, id tid.TID) error                                // Delete удаляет событие
+	GetHeads(ctx context.Context) ([]*event.Event, error)                        // GetHead возвращает последние события (головы DAG)
+	UpdateHeads(ctx context.Context, heads []tid.TID) error                      // UpdateHeads обновляет головы DAG
+}
+
+var _ Storage = (*BadgerStorage)(nil) // Проверка реализации интерфейса
 
 // BadgerStorage реализация Storage интерфейса на базе BadgerDB
 type BadgerStorage struct {
@@ -65,6 +80,38 @@ func (s *BadgerStorage) Load(ctx context.Context, id tid.TID) (*event.Event, err
 	}
 
 	return ev, err
+}
+
+// LoadFrom загружает события, начиная с указанного TID
+func (s *BadgerStorage) LoadFrom(ctx context.Context, from tid.TID) ([]*event.Event, error) {
+	events := make([]*event.Event, 0)
+
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = s.eventPrefix()
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		startKey := s.eventKey(from)
+		for it.Seek(startKey); it.Valid(); it.Next() {
+			item := it.Item()
+			err := item.Value(func(val []byte) error {
+				ev, err := event.FromJSON(val)
+				if err != nil {
+					return err
+				}
+				events = append(events, ev)
+				return nil
+			})
+
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	return events, err
 }
 
 // LoadRange загружает события в диапазоне времени

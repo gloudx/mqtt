@@ -9,6 +9,7 @@ type SchemaDefinition struct {
 	SchemaDirectives []DirectiveConfig
 	Indexes          []IndexDef
 	ConflictPolicy   ConflictPolicy
+	PrivacyConfig    *PrivacyConfig
 	//
 	GraphQLSchema string
 	CreatedAt     time.Time
@@ -60,4 +61,24 @@ const (
 type DirectiveConfig struct {
 	Name      string
 	Arguments map[string]any
+}
+
+// CollectionEncryptionType определяет тип шифрования коллекции
+type CollectionEncryptionType string
+
+const (
+	EncryptionNone     CollectionEncryptionType = "none"     // EncryptionNone - публичная коллекция без шифрования
+	EncryptionPersonal CollectionEncryptionType = "personal" // EncryptionPersonal - приватная, шифруется личным ключом автора
+	EncryptionGroup    CollectionEncryptionType = "group"    // EncryptionGroup - групповая, шифруется общим групповым ключом
+	EncryptionP2P      CollectionEncryptionType = "p2p"      // EncryptionP2P - peer-to-peer, шифруется производным ключом между двумя участниками
+	EncryptionHybrid   CollectionEncryptionType = "hybrid"   // EncryptionHybrid - гибридный режим (разные записи могут иметь разное шифрование)
+)
+
+// PrivacyConfig конфигурация шифрования для коллекции
+type PrivacyConfig struct {
+	Type                   CollectionEncryptionType `json:"type"`                             // Type тип шифрования коллекции
+	KeyID                  string                   `json:"keyId,omitempty"`                  // KeyID идентификатор ключа (для group/p2p)
+	Participants           []string                 `json:"participants,omitempty"`           // Participants список DID участников (для group/p2p)
+	EncryptFields          []string                 `json:"encryptFields,omitempty"`          // EncryptFields список полей для шифрования (если пустой - шифруется весь payload)
+	AllowRecipientOverride bool                     `json:"allowRecipientOverride,omitempty"` // AllowRecipientOverride разрешает автору указывать дополнительных получателей
 }

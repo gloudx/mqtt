@@ -5,32 +5,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
-	"path/filepath"
-	"time"
-
 	"mqtt-http-tunnel/internal/collection"
 	"mqtt-http-tunnel/internal/event"
 	"mqtt-http-tunnel/internal/eventlog"
 	"mqtt-http-tunnel/internal/graphql"
 	"mqtt-http-tunnel/internal/identity"
-	"mqtt-http-tunnel/internal/keymanager"
 	"mqtt-http-tunnel/internal/schema"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 )
 
 type Server struct {
-	config       *Config
-	db           *badger.DB
-	schema       *schema.Registry
-	engine       *collection.Engine
-	resolver     *graphql.Resolver
-	httpServer   *http.Server
-	ownerDID     *identity.DID
-	keyPair      *identity.KeyPair
-	keyManager   *keymanager.KeyManager
+	config     *Config
+	db         *badger.DB
+	schema     *schema.Registry
+	engine     *collection.Engine
+	resolver   *graphql.Resolver
+	httpServer *http.Server
+	ownerDID   *identity.DID
+	keyPair    *identity.KeyPair
+	// keyManager   *keymanager.KeyManager
 	eventLog     *eventlog.EventLog
 	synchronizer *eventlog.MQTTSynchronizer
 }
@@ -124,7 +122,7 @@ func (s *Server) initIdentity() error {
 	s.keyPair = manager.GetKeyPair()
 
 	// Инициализируем KeyManager
-	s.keyManager = keymanager.NewKeyManager()
+	// s.keyManager = keymanager.NewKeyManager()
 
 	fmt.Printf("Node DID: %s\n", s.ownerDID.String())
 	fmt.Printf("Identity persisted at: %s\n", identityPath)
@@ -149,7 +147,7 @@ func (s *Server) initSynchronizer() error {
 		QoS:          s.config.MQTTConfig.QoS,
 		CleanSession: s.config.MQTTConfig.CleanSession,
 		KeyPair:      s.keyPair,
-		KeyManager:   s.keyManager,
+		// KeyManager:   s.keyManager,
 	}
 	sync, err := eventlog.NewMQTTSynchronizer(s.ownerDID, config)
 	if err != nil {
@@ -179,7 +177,7 @@ func (s *Server) initEngine() error {
 		ConflictResolution: eventlog.LastWriteWins,
 		MaxBatchSize:       100,
 		EnableGC:           false,
-		KeyManager:         s.keyManager,
+		// KeyManager:         s.keyManager,
 		OnRemoteEvent: func(ev *event.Event) error {
 			if s.engine != nil {
 				return s.engine.HandleRemoteEvent(ev)
