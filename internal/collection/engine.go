@@ -21,8 +21,8 @@ const (
 	OpCreate       Operation = "create"
 	OpUpdate       Operation = "update"
 	OpDelete       Operation = "delete"
-	OpCreateSchema Operation = "create_schema" // Создание новой схемы/коллекции
-	OpUpdateSchema Operation = "update_schema" // Обновление схемы коллекции
+	OpCreateSchema Operation = "create_schema"
+	OpUpdateSchema Operation = "update_schema"
 )
 
 type Engine struct {
@@ -41,7 +41,7 @@ type EngineConfig struct {
 	OwnerDID *identity.DID
 	KeyPair  *identity.KeyPair
 	Registry *schema.Registry
-	EventLog *eventlog.EventLog // Единый EventLog системы
+	EventLog *eventlog.EventLog
 	ClockID  uint16
 }
 
@@ -105,18 +105,22 @@ func (e *Engine) GetCollection(name string) (*Collection, error) {
 	if ok {
 		return col, nil
 	}
+
 	schemaDef, ok := e.registry.Get(name)
 	if !ok {
 		return nil, fmt.Errorf("collection %s not found", name)
 	}
+
 	col = NewCollectionWithConfig(CollectionConfig{
 		DB:        e.db,
 		SchemaDef: schemaDef,
 		EventLog:  e.eventLog,
 	})
+
 	e.mu.Lock()
 	e.collections[name] = col
 	e.mu.Unlock()
+
 	return col, nil
 }
 
@@ -150,17 +154,26 @@ func (e *Engine) ApplyEvent(ctx context.Context, id tid.TID) error {
 	if err != nil {
 		return err
 	}
-	if ev.Collection != "sys_schemas" {
-		col, err := e.GetCollection(ev.Collection)
-		if err != nil {
-			return err
-		}
-		return col.ApplyEvent(ctx, id)
+
+	// Системные события схем
+	if ev.Collection == "sys_schemas" {
+		return e.applySchemaEvent(ctx, ev)
 	}
+
+	// События коллекций
+	col, err := e.GetCollection(ev.Collection)
+	if err != nil {
+		return err
+	}
+	return col.ApplyEvent(ctx, id)
+}
+
+func (e *Engine) applySchemaEvent(ctx context.Context, ev *event.Event) error {
 	var data map[string]any
 	if err := json.Unmarshal(ev.Payload, &data); err != nil {
 		return fmt.Errorf("unmarshal schema event: %w", err)
 	}
+
 	op := Operation(ev.EventType)
 	switch op {
 	case OpCreateSchema:
@@ -177,21 +190,26 @@ func (e *Engine) schemaCreate(ctx context.Context, data map[string]any) error {
 	if !ok {
 		return fmt.Errorf("invalid schema event data")
 	}
+
 	schemaDef, err := e.registry.Create(ctx, gqlSchema)
 	if err != nil {
 		return fmt.Errorf("create schema from event: %w", err)
 	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if _, exists := e.collections[schemaDef.Name]; exists {
 		return nil
 	}
+
 	col := NewCollectionWithConfig(CollectionConfig{
 		DB:        e.db,
 		SchemaDef: schemaDef,
 		EventLog:  e.eventLog,
 	})
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.collections[schemaDef.Name] = col
+
 	return nil
 }
 
@@ -200,18 +218,23 @@ func (e *Engine) schemaUpdate(ctx context.Context, data map[string]any) error {
 	if !ok {
 		return fmt.Errorf("invalid schema update event data")
 	}
+
 	name, ok := data["name"].(string)
 	if !ok {
 		return fmt.Errorf("invalid schema update event data: missing name")
 	}
+
 	schemaDef, err := e.registry.Update(ctx, name, gqlSchema)
 	if err != nil {
 		return fmt.Errorf("update schema from event: %w", err)
 	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
 	if col, exists := e.collections[name]; exists {
 		col.updateSchema(schemaDef)
 	}
+
 	return nil
 }

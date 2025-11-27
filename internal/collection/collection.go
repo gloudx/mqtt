@@ -14,10 +14,11 @@ import (
 )
 
 type Collection struct {
-	name     string
-	schema   *schema.SchemaDefinition
-	storage  *Storage
-	eventLog *eventlog.EventLog // Ссылка на общий EventLog системы
+	name      string
+	schema    *schema.SchemaDefinition
+	storage   *Storage
+	validator *Validator              // Добавлен валидатор
+	eventLog  *eventlog.EventLog
 }
 
 type Document map[string]any
@@ -25,7 +26,7 @@ type Document map[string]any
 type CollectionConfig struct {
 	DB        *badger.DB
 	SchemaDef *schema.SchemaDefinition
-	EventLog  *eventlog.EventLog // Ссылка на общий EventLog системы
+	EventLog  *eventlog.EventLog
 }
 
 func NewCollection(db *badger.DB, schemaDef *schema.SchemaDefinition, eventLog *eventlog.EventLog) *Collection {
@@ -37,11 +38,13 @@ func NewCollection(db *badger.DB, schemaDef *schema.SchemaDefinition, eventLog *
 }
 
 func NewCollectionWithConfig(config CollectionConfig) *Collection {
+	storage := NewStorage(config.DB, config.SchemaDef.Name)
 	col := &Collection{
-		name:     config.SchemaDef.Name,
-		schema:   config.SchemaDef,
-		storage:  NewStorage(config.DB, config.SchemaDef.Name),
-		eventLog: config.EventLog, // Используем общий EventLog
+		name:      config.SchemaDef.Name,
+		schema:    config.SchemaDef,
+		storage:   storage,
+		validator: NewValidator(config.SchemaDef, storage), // Инициализация валидатора
+		eventLog:  config.EventLog,
 	}
 	return col
 }
@@ -59,31 +62,49 @@ func (c *Collection) Insert(ctx context.Context, doc Document) (*event.Event, er
 	if !ok || docID == "" {
 		return nil, fmt.Errorf("document must have 'id' field")
 	}
+
 	exists, err := c.storage.Exists(docID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to check existence: %w", err)
 	}
 	if exists {
 		return nil, fmt.Errorf("document %s already exists", docID)
 	}
 
+	// Применяем значения по умолчанию
+	doc = c.validator.ApplyDefaults(doc)
+
+	// Валидация документа
+	if err := c.validator.Validate(doc); err != nil {
+		return nil, fmt.Errorf("validation failed: %w", err)
+	}
+
 	// Создаем событие через EventLog
 	ev, err := c.eventLog.Append(ctx, c.name, string(OpCreate), doc, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to append event: %w", err)
 	}
+
 	// Применяем событие к локальному состоянию
 	if err := c.ApplyEvent(ctx, ev.EventTID); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to apply event: %w", err)
 	}
+
 	return ev, nil
 }
 
 func (c *Collection) Update(ctx context.Context, docID string, changes Document) (*event.Event, error) {
 	existing, err := c.storage.Get(docID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("document not found: %w", err)
 	}
+
+	// Валидация изменений (включая проверку @immutable)
+	if err := c.validator.ValidateUpdate(changes, existing); err != nil {
+		return nil, fmt.Errorf("validation failed: %w", err)
+	}
+
+	// Применяем изменения
 	for k, v := range changes {
 		existing[k] = v
 	}
@@ -91,33 +112,39 @@ func (c *Collection) Update(ctx context.Context, docID string, changes Document)
 	// Создаем событие через EventLog
 	ev, err := c.eventLog.Append(ctx, c.name, string(OpUpdate), existing, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to append event: %w", err)
 	}
+
 	// Применяем событие к локальному состоянию
 	if err := c.ApplyEvent(ctx, ev.EventTID); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to apply event: %w", err)
 	}
+
 	return ev, nil
 }
 
 func (c *Collection) Delete(ctx context.Context, docID string) (*event.Event, error) {
 	exists, err := c.storage.Exists(docID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to check existence: %w", err)
 	}
 	if !exists {
 		return nil, fmt.Errorf("document %s not found", docID)
 	}
+
 	doc := Document{"id": docID}
+
 	// Создаем событие через EventLog
 	ev, err := c.eventLog.Append(ctx, c.name, string(OpDelete), doc, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to append event: %w", err)
 	}
+
 	// Применяем событие к локальному состоянию
 	if err := c.ApplyEvent(ctx, ev.EventTID); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to apply event: %w", err)
 	}
+
 	return ev, nil
 }
 
@@ -127,9 +154,11 @@ func (c *Collection) Get(ctx context.Context, docID string) (Document, error) {
 
 // Query параметры запроса к коллекции
 type Query struct {
-	Filter map[string]interface{}
-	Limit  int
-	Offset int
+	Filter  map[string]interface{}
+	Limit   int
+	Offset  int
+	OrderBy string // Поле для сортировки
+	Desc    bool   // Сортировка по убыванию
 }
 
 // QueryResult результат запроса
@@ -139,7 +168,6 @@ type QueryResult struct {
 }
 
 func (c *Collection) Query(ctx context.Context, q Query) (*QueryResult, error) {
-
 	docs := make([]Document, 0)
 	prefix := c.storage.docPrefix()
 
@@ -148,26 +176,125 @@ func (c *Collection) Query(ctx context.Context, q Query) (*QueryResult, error) {
 		if err := json.Unmarshal(value, &doc); err != nil {
 			return err
 		}
-		docs = append(docs, doc)
+
+		// Применяем фильтры
+		if c.matchesFilter(doc, q.Filter) {
+			docs = append(docs, doc)
+		}
 		return nil
 	})
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("scan failed: %w", err)
 	}
 
-	if q.Limit > 0 && q.Offset < len(docs) {
-		end := q.Offset + q.Limit
-		if end > len(docs) {
-			end = len(docs)
+	total := len(docs)
+
+	// TODO: Реализовать сортировку по q.OrderBy и q.Desc
+
+	// Пагинация
+	if q.Offset > 0 {
+		if q.Offset >= len(docs) {
+			docs = []Document{}
+		} else {
+			docs = docs[q.Offset:]
 		}
-		docs = docs[q.Offset:end]
+	}
+
+	if q.Limit > 0 && q.Limit < len(docs) {
+		docs = docs[:q.Limit]
 	}
 
 	return &QueryResult{
 		Documents: docs,
-		Total:     len(docs),
+		Total:     total,
 	}, nil
+}
+
+// matchesFilter проверяет соответствие документа фильтру
+func (c *Collection) matchesFilter(doc Document, filter map[string]interface{}) bool {
+	if len(filter) == 0 {
+		return true
+	}
+
+	for key, filterVal := range filter {
+		docVal, exists := doc[key]
+		if !exists {
+			return false
+		}
+
+		// Простое сравнение равенства
+		// TODO: Поддержка операторов (gt, lt, contains и т.д.)
+		if filterVal != docVal {
+			// Проверяем вложенные операторы
+			if filterMap, ok := filterVal.(map[string]interface{}); ok {
+				if !c.matchesOperators(docVal, filterMap) {
+					return false
+				}
+			} else {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// matchesOperators проверяет соответствие значения операторам фильтра
+func (c *Collection) matchesOperators(docVal interface{}, operators map[string]interface{}) bool {
+	for op, opVal := range operators {
+		switch op {
+		case "equals":
+			if docVal != opVal {
+				return false
+			}
+		case "contains":
+			strDoc, okDoc := docVal.(string)
+			strOp, okOp := opVal.(string)
+			if okDoc && okOp {
+				if !contains(strDoc, strOp) {
+					return false
+				}
+			}
+		case "startsWith":
+			strDoc, okDoc := docVal.(string)
+			strOp, okOp := opVal.(string)
+			if okDoc && okOp {
+				if !startsWith(strDoc, strOp) {
+					return false
+				}
+			}
+		case "endsWith":
+			strDoc, okDoc := docVal.(string)
+			strOp, okOp := opVal.(string)
+			if okDoc && okOp {
+				if !endsWith(strDoc, strOp) {
+					return false
+				}
+			}
+		case "gt":
+			if !compareNumbers(docVal, opVal, ">") {
+				return false
+			}
+		case "gte":
+			if !compareNumbers(docVal, opVal, ">=") {
+				return false
+			}
+		case "lt":
+			if !compareNumbers(docVal, opVal, "<") {
+				return false
+			}
+		case "lte":
+			if !compareNumbers(docVal, opVal, "<=") {
+				return false
+			}
+		case "in":
+			if !inSlice(docVal, opVal) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (c *Collection) Count(ctx context.Context) (int, error) {
@@ -177,30 +304,35 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 // updateSchema обновляет схему коллекции
 func (c *Collection) updateSchema(schemaDef *schema.SchemaDefinition) {
 	c.schema = schemaDef
+	c.validator = NewValidator(schemaDef, c.storage) // Пересоздаём валидатор
 }
 
 func (c *Collection) ApplyEvent(ctx context.Context, id tid.TID) error {
 	ev, err := c.eventLog.Get(ctx, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get event: %w", err)
 	}
+
 	// Проверка: событие должно относиться к этой коллекции
 	if ev.Collection != c.name {
 		return fmt.Errorf("event collection mismatch: event for '%s', but collection is '%s'", ev.Collection, c.name)
 	}
+
 	var doc Document
 	if err := json.Unmarshal(ev.Payload, &doc); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal payload: %w", err)
 	}
+
 	docID, ok := doc["id"].(string)
 	if !ok {
 		return fmt.Errorf("event payload must have 'id' field")
 	}
+
 	op := Operation(ev.EventType)
 	switch op {
 	case OpCreate, OpUpdate:
 		if err := c.storage.Put(docID, doc); err != nil {
-			return err
+			return fmt.Errorf("failed to store document: %w", err)
 		}
 		return nil
 	case OpDelete:
@@ -208,4 +340,72 @@ func (c *Collection) ApplyEvent(ctx context.Context, id tid.TID) error {
 	default:
 		return fmt.Errorf("unknown operation: %s", op)
 	}
+}
+
+// Вспомогательные функции для фильтрации
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func startsWith(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+func endsWith(s, suffix string) bool {
+	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
+}
+
+func compareNumbers(a, b interface{}, op string) bool {
+	aFloat := toFloat64(a)
+	bFloat := toFloat64(b)
+
+	switch op {
+	case ">":
+		return aFloat > bFloat
+	case ">=":
+		return aFloat >= bFloat
+	case "<":
+		return aFloat < bFloat
+	case "<=":
+		return aFloat <= bFloat
+	}
+	return false
+}
+
+func toFloat64(v interface{}) float64 {
+	switch n := v.(type) {
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case float32:
+		return float64(n)
+	case float64:
+		return n
+	}
+	return 0
+}
+
+func inSlice(val interface{}, slice interface{}) bool {
+	s, ok := slice.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, item := range s {
+		if item == val {
+			return true
+		}
+	}
+	return false
 }

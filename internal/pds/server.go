@@ -180,7 +180,7 @@ func (s *Server) initEngine() error {
 		// KeyManager:         s.keyManager,
 		OnRemoteEvent: func(ev *event.Event) error {
 			if s.engine != nil {
-				return s.engine.HandleRemoteEvent(ev)
+				return s.engine.ApplyEvent(context.Background(), ev.EventTID)
 			}
 			return nil
 		},
