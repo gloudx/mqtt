@@ -11,6 +11,7 @@ import (
 	"mqtt-http-tunnel/internal/graphql"
 	"mqtt-http-tunnel/internal/identity"
 	"mqtt-http-tunnel/internal/schema"
+	"mqtt-http-tunnel/internal/storage"
 	"mqtt-http-tunnel/internal/synchronizer"
 	"net/http"
 	"os"
@@ -21,15 +22,14 @@ import (
 )
 
 type Server struct {
-	config     *Config
-	db         *badger.DB
-	schema     *schema.Registry
-	engine     *collection.Engine
-	resolver   *graphql.Resolver
-	httpServer *http.Server
-	ownerDID   *identity.DID
-	keyPair    *identity.KeyPair
-	// keyManager   *keymanager.KeyManager
+	config       *Config
+	db           *badger.DB
+	schema       *schema.Registry
+	engine       *collection.Engine
+	resolver     *graphql.Resolver
+	httpServer   *http.Server
+	ownerDID     *identity.DID
+	keyPair      *identity.KeyPair
 	eventLog     *eventlog.EventLog
 	synchronizer *synchronizer.MQTTSynchronizer
 }
@@ -53,9 +53,9 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("init identity: %w", err)
 	}
 
-	if err := s.initSynchronizer(); err != nil {
-		return fmt.Errorf("init synchronizer: %w", err)
-	}
+	// if err := s.initSynchronizer(); err != nil {
+	// 	return fmt.Errorf("init synchronizer: %w", err)
+	// }
 
 	if err := s.initEngine(); err != nil {
 		return fmt.Errorf("init engine: %w", err)
@@ -130,41 +130,41 @@ func (s *Server) initIdentity() error {
 	return nil
 }
 
-func (s *Server) initSynchronizer() error {
-	if !s.config.MQTTConfig.Enabled {
-		fmt.Println("MQTT synchronizer disabled")
-		return nil
-	}
-	clientID := s.config.MQTTConfig.ClientID
-	if clientID == "" {
-		clientID = fmt.Sprintf("pds-%s", s.ownerDID.String()[:16])
-	}
-	config := synchronizer.MQTTConfig{
-		Broker:       s.config.MQTTConfig.Broker,
-		ClientID:     clientID,
-		Username:     s.config.MQTTConfig.Username,
-		Password:     s.config.MQTTConfig.Password,
-		TopicPrefix:  s.config.MQTTConfig.TopicPrefix,
-		QoS:          s.config.MQTTConfig.QoS,
-		CleanSession: s.config.MQTTConfig.CleanSession,
-		KeyPair:      s.keyPair,
-		// KeyManager:   s.keyManager,
-	}
-	sync, err := synchronizer.NewMQTTSynchronizer(s.ownerDID, config)
-	if err != nil {
-		return fmt.Errorf("create MQTT synchronizer: %w", err)
-	}
-	s.synchronizer = sync
-	fmt.Printf("MQTT synchronizer connected to %s\n", s.config.MQTTConfig.Broker)
-	return nil
-}
+// func (s *Server) initSynchronizer() error {
+// 	if !s.config.MQTTConfig.Enabled {
+// 		fmt.Println("MQTT synchronizer disabled")
+// 		return nil
+// 	}
+// 	clientID := s.config.MQTTConfig.ClientID
+// 	if clientID == "" {
+// 		clientID = fmt.Sprintf("pds-%s", s.ownerDID.String()[:16])
+// 	}
+// 	config := synchronizer.MQTTConfig{
+// 		Broker:       s.config.MQTTConfig.Broker,
+// 		ClientID:     clientID,
+// 		Username:     s.config.MQTTConfig.Username,
+// 		Password:     s.config.MQTTConfig.Password,
+// 		TopicPrefix:  s.config.MQTTConfig.TopicPrefix,
+// 		QoS:          s.config.MQTTConfig.QoS,
+// 		CleanSession: s.config.MQTTConfig.CleanSession,
+// 		KeyPair:      s.keyPair,
+// 		// KeyManager:   s.keyManager,
+// 	}
+// 	sync, err := synchronizer.NewMQTTSynchronizer(s.ownerDID, config)
+// 	if err != nil {
+// 		return fmt.Errorf("create MQTT synchronizer: %w", err)
+// 	}
+// 	s.synchronizer = sync
+// 	fmt.Printf("MQTT synchronizer connected to %s\n", s.config.MQTTConfig.Broker)
+// 	return nil
+// }
 
 func (s *Server) initEngine() error {
 	s.schema = schema.NewRegistry(s.db)
 	if err := s.schema.LoadAll(context.Background()); err != nil {
 		return err
 	}
-	storage := eventlog.NewBadgerStorage(s.db, "eventlog:system")
+	storage := storage.NewBadgerStorage(s.db, "eventlog:system")
 	var synchronizer synchronizer.Synchronizer
 	if s.synchronizer != nil {
 		synchronizer = s.synchronizer
@@ -282,7 +282,7 @@ func (s *Server) createCollectionHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	col, err := s.engine.CreateCollection(r.Context(), req.Schema)
+	ev, err := s.engine.CreateCollection(r.Context(), req.Schema)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -293,7 +293,7 @@ func (s *Server) createCollectionHandler(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"name":    col.Name(),
+		"name":    ev.Collection,
 		"message": "Collection created successfully",
 	})
 }
@@ -319,7 +319,7 @@ func (s *Server) updateCollectionHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "schema is required", http.StatusBadRequest)
 		return
 	}
-	col, err := s.engine.UpdateCollection(r.Context(), req.Name, req.Schema)
+	ev, err := s.engine.UpdateCollection(r.Context(), req.Name, req.Schema)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -330,8 +330,7 @@ func (s *Server) updateCollectionHandler(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"name":    col.Name(),
-		"version": col.Schema().Version,
+		"name":    ev.Collection,
 		"message": "Collection schema updated successfully",
 	})
 }

@@ -193,6 +193,9 @@ func (r *Ripples) publish(cfg *Config) {
 		r.logger.Error().Err(err).Str("type", cfg.Type).Msg("Publisher error")
 		return
 	}
+	if env == nil {
+		return
+	}
 	env.Type = cfg.Type
 	env.FromDID = r.ownerDID
 	env.Timestamp = time.Now().UnixMilli()

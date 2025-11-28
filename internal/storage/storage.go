@@ -232,6 +232,33 @@ func (s *BadgerStorage) LoadAll(ctx context.Context) ([]*event.Event, error) {
 	return events, err
 }
 
+// ItrateAll итерирует все события и применяет функцию handler
+func (s *BadgerStorage) ItrateAll(ctx context.Context, handler func(*event.Event) error) error {
+	return s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = s.eventPrefix()
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+
+			err := item.Value(func(val []byte) error {
+				ev, err := event.FromJSON(val)
+				if err != nil {
+					return err
+				}
+				return handler(ev)
+			})
+
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // Delete удаляет событие
 func (s *BadgerStorage) Delete(ctx context.Context, id tid.TID) error {
 	key := s.eventKey(id)

@@ -2,7 +2,6 @@
 package schema
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -65,8 +64,8 @@ func (p *Parser) Parse(gqlSchema string) (*SchemaDefinition, error) {
 	}
 
 	// pretty print for debugging
-	b, _ := json.MarshalIndent(def, "", "  ")
-	fmt.Println(string(b))
+	// b, _ := json.MarshalIndent(def, "", "  ")
+	// fmt.Println(string(b))
 
 	return def, nil
 }
