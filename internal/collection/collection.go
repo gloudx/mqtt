@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"mqtt-http-tunnel/internal/event"
-	"mqtt-http-tunnel/internal/eventlog"
 	"mqtt-http-tunnel/internal/schema"
 	"mqtt-http-tunnel/internal/tid"
 	"sort"

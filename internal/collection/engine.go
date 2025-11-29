@@ -5,8 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"mqtt-http-tunnel/internal/event"
-	"mqtt-http-tunnel/internal/eventlog"
+	"mqtt-http-tunnel/internal/elog"
 	"mqtt-http-tunnel/internal/identity"
 	"mqtt-http-tunnel/internal/schema"
 	"mqtt-http-tunnel/internal/tid"
@@ -31,7 +30,7 @@ type Engine struct {
 	collections map[string]*Collection
 	ownerDID    *identity.DID
 	keyPair     *identity.KeyPair
-	eventLog    *eventlog.EventLog
+	eventLog    *elog.SecureLog
 	clockID     uint16
 	mu          sync.RWMutex
 }
