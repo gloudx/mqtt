@@ -16,10 +16,13 @@ func (s *Sync) publishHeads(ctx context.Context) (*ripples.Envelope, error) {
 	for i, h := range heads {
 		headsBytes[i] = h[:]
 	}
-	payload, _ := json.Marshal(&HeadsPayload{
+	payload, err := json.Marshal(&HeadsPayload{
 		LogID: s.logID,
 		Heads: headsBytes,
 	})
+	if err != nil {
+		return nil, err
+	}
 	return &ripples.Envelope{Payload: payload}, nil
 }
 

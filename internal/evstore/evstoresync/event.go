@@ -8,6 +8,15 @@ import (
 	"mqtt-http-tunnel/internal/ripples"
 )
 
+// handleEvent обрабатывает полученное событие
+//
+// Алгоритм:
+// 1. Десериализация EventPayload
+// 2. Проверка что событие было запрошено (защита от спама)
+// 3. Сохранение через Store.Put()
+// 4. Верификация CID для проверки целостности
+// 5. Рекурсивный запрос недостающих родителей
+// 6. Попытка merge если все родители получены
 func (s *Sync) handleEvent(ctx context.Context, env *ripples.Envelope) error {
 	var p EventPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
@@ -69,6 +78,11 @@ func (s *Sync) handleEvent(ctx context.Context, env *ripples.Envelope) error {
 	return nil
 }
 
+// tryMerge пытается добавить CID в heads если все родители получены
+//
+// Событие может быть добавлено в heads только когда вся его история
+// (все родители) уже присутствует в локальном Store. Это гарантирует
+// что DAG остается связным.
 func (s *Sync) tryMerge(cid evstore.CID) {
 	// Можно мержить если все parents есть
 	parents, err := s.store.Parents(cid)
