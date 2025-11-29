@@ -22,7 +22,7 @@ import (
 
 const exportVersion = 1
 
-// Export сохраняет весь лог в файл
+// Export сохраняет весь лог в файл (streaming)
 func (s *Store) Export(path string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -34,30 +34,24 @@ func (s *Store) Export(path string) error {
 	defer f.Close()
 
 	w := bufio.NewWriter(f)
+	defer w.Flush()
 
 	// Version
 	if err := binary.Write(w, binary.BigEndian, uint32(exportVersion)); err != nil {
 		return err
 	}
 
-	// Собираем события
-	var events []*Event
+	// Подсчитываем события (первый проход)
+	var eventCount uint32
 	err = s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
 		opts.Prefix = prefixEvents
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Rewind(); it.Valid(); it.Next() {
-			var event *Event
-			if err := it.Item().Value(func(val []byte) error {
-				var err error
-				event, err = UnmarshalEvent(val)
-				return err
-			}); err != nil {
-				continue
-			}
-			events = append(events, event)
+			eventCount++
 		}
 		return nil
 	})
@@ -66,40 +60,49 @@ func (s *Store) Export(path string) error {
 	}
 
 	// Event count
-	if err := binary.Write(w, binary.BigEndian, uint32(len(events))); err != nil {
+	if err := binary.Write(w, binary.BigEndian, eventCount); err != nil {
 		return err
 	}
 
-	// Events
-	for _, event := range events {
-		data := event.Marshal()
-		if err := binary.Write(w, binary.BigEndian, uint32(len(data))); err != nil {
-			return err
+	// Events (второй проход - streaming write)
+	err = s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefixEvents
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			if err := it.Item().Value(func(val []byte) error {
+				// Записываем напрямую, не создавая Event объект
+				if err := binary.Write(w, binary.BigEndian, uint32(len(val))); err != nil {
+					return err
+				}
+				_, err := w.Write(val)
+				return err
+			}); err != nil {
+				return err
+			}
 		}
-		if _, err := w.Write(data); err != nil {
-			return err
-		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
-	// Heads count
+	// Heads
 	heads := s.sortedHeads()
 	if err := binary.Write(w, binary.BigEndian, uint32(len(heads))); err != nil {
 		return err
 	}
 
-	// Heads
 	for _, h := range heads {
 		if _, err := w.Write(h[:]); err != nil {
 			return err
 		}
 	}
 
-	if err := w.Flush(); err != nil {
-		return err
-	}
-
 	s.logger.Info().
-		Int("events", len(events)).
+		Uint32("events", eventCount).
 		Int("heads", len(heads)).
 		Str("path", path).
 		Msg("exported")
@@ -185,50 +188,74 @@ func (s *Store) Import(path string) error {
 	return nil
 }
 
-// ExportWriter экспортирует в io.Writer
+// ExportWriter экспортирует в io.Writer (streaming)
 func (s *Store) ExportWriter(w io.Writer) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	bw := bufio.NewWriter(w)
+	defer bw.Flush()
 
 	if err := binary.Write(bw, binary.BigEndian, uint32(exportVersion)); err != nil {
 		return err
 	}
 
-	var events []*Event
-	s.db.View(func(txn *badger.Txn) error {
+	// Подсчет событий
+	var eventCount uint32
+	if err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = prefixEvents
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			eventCount++
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := binary.Write(bw, binary.BigEndian, eventCount); err != nil {
+		return err
+	}
+
+	// Streaming write событий
+	if err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = prefixEvents
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Rewind(); it.Valid(); it.Next() {
-			it.Item().Value(func(val []byte) error {
-				if event, err := UnmarshalEvent(val); err == nil {
-					events = append(events, event)
+			if err := it.Item().Value(func(val []byte) error {
+				if err := binary.Write(bw, binary.BigEndian, uint32(len(val))); err != nil {
+					return err
 				}
-				return nil
-			})
+				_, err := bw.Write(val)
+				return err
+			}); err != nil {
+				return err
+			}
 		}
 		return nil
-	})
-
-	binary.Write(bw, binary.BigEndian, uint32(len(events)))
-
-	for _, event := range events {
-		data := event.Marshal()
-		binary.Write(bw, binary.BigEndian, uint32(len(data)))
-		bw.Write(data)
+	}); err != nil {
+		return err
 	}
 
+	// Heads
 	heads := s.sortedHeads()
-	binary.Write(bw, binary.BigEndian, uint32(len(heads)))
+	if err := binary.Write(bw, binary.BigEndian, uint32(len(heads))); err != nil {
+		return err
+	}
 	for _, h := range heads {
-		bw.Write(h[:])
+		if _, err := bw.Write(h[:]); err != nil {
+			return err
+		}
 	}
 
-	return bw.Flush()
+	return nil
 }
 
 // ImportReader импортирует из io.Reader

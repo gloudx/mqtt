@@ -1,3 +1,63 @@
+// Package evstore реализует event store с DAG структурой для распределенных систем.
+//
+// # Архитектура
+//
+// Event Store хранит события в виде направленного ациклического графа (DAG),
+// где каждое событие может иметь несколько родителей. Это позволяет:
+// - Отслеживать причинно-следственные связи между событиями
+// - Работать в условиях распределенной системы с eventual consistency
+// - Автоматически разрешать конфликты через merge events
+//
+// # Concurrent Behavior
+//
+// Store является thread-safe и поддерживает concurrent доступ:
+//
+// 1. Чтение (Get, Has, Range, Heads):
+//    - Используют RLock для параллельного чтения
+//    - Безопасны для вызова из нескольких горутин
+//    - Возвращают snapshot состояния на момент вызова
+//
+// 2. Запись (Append, Put):
+//    - Используют Lock для эксклюзивного доступа
+//    - Сериализуются автоматически
+//    - Каждая операция атомарна (через Badger transactions)
+//
+// 3. Heads Management:
+//    - Heads - это множество CID без потомков (вершины DAG)
+//    - При Append: новый CID добавляется в heads, его parents удаляются
+//    - При Put: heads НЕ изменяются (требуется явный вызов Merge)
+//    - Инвариант: heads всегда представляет актуальное состояние графа
+//
+// 4. Fork Resolution:
+//    - Fork возникает когда heads.len > 1 (несколько независимых веток)
+//    - Автоматическое разрешение: ResolveFork() создает merge event
+//    - Merge event имеет всех heads как родителей
+//    - После merge остается один head
+//
+// # Concurrent Append Scenario
+//
+// Если два узла одновременно вызывают Append:
+//
+//   Node A: Append(data1) -> Event1 с parents=[Head0]
+//   Node B: Append(data2) -> Event2 с parents=[Head0]
+//
+// Результат: два heads [Event1, Event2] - это fork.
+// Решение: вызвать ResolveFork() для создания merge event.
+//
+// # Event Subscribers
+//
+// Subscribe позволяет получать уведомления о новых событиях:
+// - Callback вызывается ПОСЛЕ успешной записи в БД
+// - Callback вызывается БЕЗ удержания мьютекса (безопасно для I/O)
+// - Паника в callback перехватывается и логируется
+// - Unsubscribe через возвращаемую функцию
+//
+// Пример:
+//   unsubscribe := store.Subscribe(func(cid CID, event *Event) {
+//       fmt.Printf("New event: %s\n", cid.Short())
+//   })
+//   defer unsubscribe()
+//
 package evstore
 
 import (
@@ -21,10 +81,14 @@ var (
 	keyHLC         = []byte("meta/hlc")
 )
 
+// EventHandler - callback для уведомления о новых событиях
+type EventHandler func(cid CID, event *Event)
+
 type Store struct {
-	db    *badger.DB
-	clock *hlc.Clock
-	heads map[CID]struct{}
+	db          *badger.DB
+	clock       *hlc.Clock
+	heads       map[CID]struct{}
+	subscribers []EventHandler // Подписчики на новые события
 	//
 	mu     sync.RWMutex
 	logger zerolog.Logger
@@ -54,6 +118,52 @@ func OpenStore(cfg *StoreConfig) (*Store, error) {
 	}
 	s.logger.Info().Int("heads", len(s.heads)).Msg("store opened")
 	return s, nil
+}
+
+// Subscribe подписывается на новые события
+// Возвращает функцию для отписки
+func (s *Store) Subscribe(handler EventHandler) func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.subscribers = append(s.subscribers, handler)
+	index := len(s.subscribers) - 1
+
+	// Возвращаем функцию отписки
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// Удаляем подписчика, заменяя его на nil
+		if index < len(s.subscribers) {
+			s.subscribers[index] = nil
+		}
+	}
+}
+
+// notifySubscribers уведомляет всех подписчиков о новом событии
+// Вызывается без удержания мьютекса, чтобы избежать deadlock
+func (s *Store) notifySubscribers(cid CID, event *Event) {
+	s.mu.RLock()
+	handlers := make([]EventHandler, 0, len(s.subscribers))
+	for _, h := range s.subscribers {
+		if h != nil {
+			handlers = append(handlers, h)
+		}
+	}
+	s.mu.RUnlock()
+
+	// Вызываем handlers без удержания мьютекса
+	for _, h := range handlers {
+		// Безопасный вызов в defer для перехвата паники
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Error().Interface("panic", r).Msg("subscriber panic")
+				}
+			}()
+			h(cid, event)
+		}()
+	}
 }
 
 func (s *Store) Close() error {
@@ -113,7 +223,6 @@ func (s *Store) sortedHeads() []CID {
 // Append добавляет новое событие
 func (s *Store) Append(data []byte) (*Event, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	tid := s.clock.TID()
 	parents := s.sortedHeads()
 	event := &Event{
@@ -142,32 +251,44 @@ func (s *Store) Append(data []byte) (*Event, error) {
 		if err := txn.Set(indexKey, tid.Bytes()); err != nil {
 			return err
 		}
-		// Heads
-		s.heads = map[CID]struct{}{cid: {}}
+		// Heads - добавляем новый и удаляем родителей
+		// Это правильное поведение для DAG: новое событие становится head,
+		// а его parents перестают быть heads
+		s.heads[cid] = struct{}{}
+		for _, p := range parents {
+			delete(s.heads, p)
+		}
 		if err := s.saveHeads(txn); err != nil {
 			return err
 		}
 		// HLC
 		return s.saveHLC(txn)
 	})
+	s.mu.Unlock()
+
 	if err != nil {
 		return nil, err
 	}
+
 	s.logger.Debug().
 		Str("cid", cid.Short()).
 		Str("tid", tid.String()).
 		Int("parents", len(parents)).
 		Msg("appended")
+
+	// Уведомляем подписчиков (после разблокировки мьютекса)
+	s.notifySubscribers(cid, event)
+
 	return event, nil
 }
 
 // Put добавляет событие от другого узла
 func (s *Store) Put(event *Event) (CID, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	cid := event.CID()
 	// Проверяем дубликат
 	if s.hasCID(cid) {
+		s.mu.Unlock()
 		return cid, nil
 	}
 	// Обновляем HLC
@@ -195,18 +316,35 @@ func (s *Store) Put(event *Event) (CID, error) {
 		// HLC
 		return s.saveHLC(txn)
 	})
+	s.mu.Unlock()
+
 	if err != nil {
 		return CID{}, err
 	}
+
 	s.logger.Debug().
 		Str("cid", cid.Short()).
 		Str("tid", event.TID.String()).
 		Msg("put")
 
+	// Уведомляем подписчиков (после разблокировки мьютекса)
+	s.notifySubscribers(cid, event)
+
 	return cid, nil
 }
 
-// Merge добавляет CID в heads и убирает его parents из heads
+// Merge добавляет CID в heads и убирает его parents из heads.
+//
+// Этот метод используется после Put() для обновления heads после
+// получения событий от других узлов. В отличие от Append, который
+// автоматически обновляет heads, Put требует явного вызова Merge.
+//
+// Алгоритм:
+// 1. Для каждого CID проверяется наличие события и всех его родителей
+// 2. Если все условия выполнены, CID добавляется в heads
+// 3. Родители CID удаляются из heads (они больше не вершины)
+//
+// Concurrent safety: метод thread-safe, изменения атомарны.
 func (s *Store) Merge(cids []CID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -395,7 +533,79 @@ func (s *Store) Clock() *hlc.Clock {
 	return s.clock
 }
 
-// Range итерирует события по диапазону TID
+// HasFork возвращает true если есть несколько heads (fork в DAG)
+func (s *Store) HasFork() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.heads) > 1
+}
+
+// ResolveFork создает merge event который объединяет все текущие heads
+// Это автоматическое разрешение форков через создание события-слияния
+// Возвращает созданное событие или nil если форка нет
+func (s *Store) ResolveFork(data []byte) (*Event, error) {
+	s.mu.Lock()
+	if len(s.heads) <= 1 {
+		s.mu.Unlock()
+		return nil, nil // Нет форка
+	}
+
+	tid := s.clock.TID()
+	parents := s.sortedHeads()
+	event := &Event{
+		TID:     tid,
+		Parents: parents,
+		Data:    data,
+	}
+	cid := event.CID()
+
+	err := s.db.Update(func(txn *badger.Txn) error {
+		// Event
+		eventKey := append(prefixEvents, tid.Bytes()...)
+		if err := txn.Set(eventKey, event.Marshal()); err != nil {
+			return err
+		}
+		// DAG
+		dagVal := make([]byte, len(parents)*32)
+		for i, p := range parents {
+			copy(dagVal[i*32:], p[:])
+		}
+		dagKey := append(prefixDAG, cid[:]...)
+		if err := txn.Set(dagKey, dagVal); err != nil {
+			return err
+		}
+		// CID Index
+		indexKey := append(prefixCIDIndex, cid[:]...)
+		if err := txn.Set(indexKey, tid.Bytes()); err != nil {
+			return err
+		}
+		// Heads - все heads заменяются на новый merge event
+		s.heads = map[CID]struct{}{cid: {}}
+		if err := s.saveHeads(txn); err != nil {
+			return err
+		}
+		// HLC
+		return s.saveHLC(txn)
+	})
+	s.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+
+	s.logger.Info().
+		Str("cid", cid.Short()).
+		Str("tid", tid.String()).
+		Int("merged_heads", len(parents)).
+		Msg("fork resolved")
+
+	// Уведомляем подписчиков
+	s.notifySubscribers(cid, event)
+
+	return event, nil
+}
+
+// Range итерирует события по диапазону TID с prefetching
 func (s *Store) Range(from, to hlc.TID, fn func(*Event) error) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -403,6 +613,8 @@ func (s *Store) Range(from, to hlc.TID, fn func(*Event) error) error {
 	return s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = prefixEvents
+		opts.PrefetchValues = true  // Включаем prefetch для последовательного чтения
+		opts.PrefetchSize = 100     // Prefetch следующих 100 значений
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
@@ -431,42 +643,4 @@ func (s *Store) Range(from, to hlc.TID, fn func(*Event) error) error {
 
 		return nil
 	})
-}
-
-// Stats возвращает статистику
-func (s *Store) Stats() map[string]int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	stats := map[string]int{
-		"heads": len(s.heads),
-	}
-
-	s.db.View(func(txn *badger.Txn) error {
-		// Events count
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		opts.Prefix = prefixEvents
-		it := txn.NewIterator(opts)
-		count := 0
-		for it.Rewind(); it.Valid(); it.Next() {
-			count++
-		}
-		it.Close()
-		stats["events"] = count
-
-		// Index count
-		opts.Prefix = prefixCIDIndex
-		it = txn.NewIterator(opts)
-		count = 0
-		for it.Rewind(); it.Valid(); it.Next() {
-			count++
-		}
-		it.Close()
-		stats["index"] = count
-
-		return nil
-	})
-
-	return stats
 }
