@@ -83,18 +83,65 @@ func (s *Sync) handleEvent(ctx context.Context, env *ripples.Envelope) error {
 // Событие может быть добавлено в heads только когда вся его история
 // (все родители) уже присутствует в локальном Store. Это гарантирует
 // что DAG остается связным.
+//
+// Если не все родители получены, событие регистрируется в pendingChildren
+// у недостающего родителя и будет повторно проверено когда родитель придет.
 func (s *Sync) tryMerge(cid evstore.CID) {
 	// Можно мержить если все parents есть
 	parents, err := s.store.Parents(cid)
 	if err != nil {
 		return
 	}
+
+	// Проверяем наличие всех родителей
+	var missingParent evstore.CID
+	hasMissing := false
 	for _, p := range parents {
 		if !s.store.Has(p) {
-			return // ещё не все parents
+			missingParent = p
+			hasMissing = true
+			break
 		}
 	}
+
+	if hasMissing {
+		// Регистрируем как ожидающего ребенка недостающего родителя
+		s.mu.Lock()
+		s.pendingChildren[missingParent] = append(s.pendingChildren[missingParent], cid)
+		s.mu.Unlock()
+
+		s.logger.Debug().
+			Str("cid", cid.Short()).
+			Str("waiting_for", missingParent.Short()).
+			Msg("event waiting for parent")
+		return
+	}
+
+	// Все родители есть - можно мержить
 	if err := s.store.Merge([]evstore.CID{cid}); err != nil {
 		s.logger.Error().Err(err).Str("cid", cid.Short()).Msg("merge failed")
+		return
+	}
+
+	s.logger.Debug().
+		Str("cid", cid.Short()).
+		Msg("event merged")
+
+	// Проверяем есть ли дети, ожидающие это событие
+	s.mu.Lock()
+	children := s.pendingChildren[cid]
+	delete(s.pendingChildren, cid)
+	s.mu.Unlock()
+
+	if len(children) > 0 {
+		s.logger.Debug().
+			Str("parent", cid.Short()).
+			Int("children", len(children)).
+			Msg("trying to merge waiting children")
+
+		// Рекурсивно пытаемся смержить всех детей
+		for _, child := range children {
+			s.tryMerge(child)
+		}
 	}
 }
