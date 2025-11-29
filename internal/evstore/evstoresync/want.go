@@ -15,21 +15,36 @@ func (s *Sync) handleWant(ctx context.Context, env *ripples.Envelope) error {
 	if p.LogID != s.logID {
 		return nil
 	}
+
 	for _, cidBytes := range p.CIDs {
 		cid, err := evstore.CIDFromBytes(cidBytes)
 		if err != nil {
+			s.logger.Warn().Err(err).Msg("invalid CID in want payload")
 			continue
 		}
 		event, err := s.store.Get(cid)
 		if err != nil {
+			// Событие не найдено - это нормально, пропускаем
 			continue
 		}
-		s.sendEvent(event)
+		if err := s.sendEvent(event); err != nil {
+			s.logger.Error().
+				Err(err).
+				Str("cid", cid.Short()).
+				Msg("failed to send requested event")
+			// Продолжаем обработку остальных
+		}
 	}
 	return nil
 }
 
-func (s *Sync) sendEvent(event *evstore.Event) {
+func (s *Sync) sendEvent(event *evstore.Event) error {
+	// Rate limiting
+	if err := s.rateLimiter.Wait(context.Background()); err != nil {
+		s.logger.Warn().Err(err).Msg("rate limiter wait failed")
+		return err
+	}
+
 	parentsBytes := make([][]byte, len(event.Parents))
 	for i, p := range event.Parents {
 		parentsBytes[i] = p[:]
@@ -40,5 +55,11 @@ func (s *Sync) sendEvent(event *evstore.Event) {
 		Parents: parentsBytes,
 		Data:    event.Data,
 	}
-	s.ripples.Send(TypeEvent, TypeEvent, payload)
+
+	if err := s.ripples.Send(TypeEvent, TypeEvent, payload); err != nil {
+		s.logger.Error().Err(err).Msg("failed to send event")
+		return err
+	}
+
+	return nil
 }
