@@ -40,12 +40,12 @@ const (
 )
 
 const (
-	MaxPending         = 10000              // Максимум одновременных pending запросов
-	PendingTTL         = 2 * time.Minute    // TTL для pending запросов
-	RetryInterval      = 5 * time.Second    // Интервал для retry
-	MaxRetries         = 3                  // Максимум попыток retry
-	RateLimitPerSecond = 100                // Максимум 100 событий в секунду
-	RateLimitBurst     = 200                // Burst до 200 событий
+	MaxPending         = 10000           // Максимум одновременных pending запросов
+	PendingTTL         = 2 * time.Minute // TTL для pending запросов
+	RetryInterval      = 5 * time.Second // Интервал для retry
+	MaxRetries         = 3               // Максимум попыток retry
+	RateLimitPerSecond = 100             // Максимум 100 событий в секунду
+	RateLimitBurst     = 200             // Burst до 200 событий
 )
 
 var (
@@ -80,13 +80,13 @@ type pendingRequest struct {
 }
 
 type Sync struct {
-	store        *evstore.Store
-	ripples      *ripples.Ripples
-	logID        string
-	logger       zerolog.Logger
-	pending      map[evstore.CID]*pendingRequest // запрошенные CID с retry счетчиком
-	rateLimiter  *rate.Limiter                   // rate limiting для отправки событий
-	unsubscribe  func()                          // функция отписки от Store
+	store       *evstore.Store
+	ripples     *ripples.Ripples
+	logID       string
+	logger      zerolog.Logger
+	pending     map[evstore.CID]*pendingRequest // запрошенные CID с retry счетчиком
+	rateLimiter *rate.Limiter                   // rate limiting для отправки событий
+	unsubscribe func()                          // функция отписки от Store
 	//
 	mu     sync.Mutex
 	ctx    context.Context
@@ -318,12 +318,6 @@ func (s *Sync) BroadcastHeads() {
 	}
 
 	s.logger.Debug().Int("heads", len(heads)).Msg("broadcast heads")
-}
-
-// OnAppend deprecated: используйте автоматическую подписку через Subscribe
-// Метод оставлен для обратной совместимости
-func (s *Sync) OnAppend() {
-	s.BroadcastHeads()
 }
 
 func (s *Sync) Close() {

@@ -2,6 +2,7 @@ package evstore
 
 import (
 	"bytes"
+	"mqtt-http-tunnel/internal/hlc"
 	"sort"
 
 	badger "github.com/dgraph-io/badger/v4"
