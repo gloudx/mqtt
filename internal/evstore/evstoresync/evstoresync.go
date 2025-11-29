@@ -14,6 +14,19 @@
 // - Retry с backoff: повторная попытка получения недостающих событий
 // - Верификация CID: проверка целостности полученных данных
 //
+// # Отложенный merge (Pending Children)
+//
+// События могут приходить в произвольном порядке. Если событие E3 с родителями
+// [E1, E2] приходит раньше E2, оно не может быть добавлено в heads.
+//
+// Механизм pendingChildren отслеживает такие ситуации:
+// 1. При получении E3: если E2 отсутствует, регистрируем E3 как ребенка E2
+// 2. При получении E2: после merge проверяем pendingChildren[E2]
+// 3. Рекурсивно пытаемся смержить всех ожидающих детей
+//
+// Это гарантирует что события будут добавлены в heads независимо от
+// порядка получения, как только вся их история станет доступна.
+//
 // # Автоматическая интеграция
 //
 // Sync автоматически подписывается на события Store и broadcast их
@@ -80,13 +93,14 @@ type pendingRequest struct {
 }
 
 type Sync struct {
-	store        *evstore.Store
-	ripples      *ripples.Ripples
-	logID        string
-	logger       zerolog.Logger
-	pending      map[evstore.CID]*pendingRequest // запрошенные CID с retry счетчиком
-	rateLimiter  *rate.Limiter                   // rate limiting для отправки событий
-	unsubscribe  func()                          // функция отписки от Store
+	store           *evstore.Store
+	ripples         *ripples.Ripples
+	logID           string
+	logger          zerolog.Logger
+	pending         map[evstore.CID]*pendingRequest // запрошенные CID с retry счетчиком
+	pendingChildren map[evstore.CID][]evstore.CID   // parent → children ожидающие родителя
+	rateLimiter     *rate.Limiter                   // rate limiting для отправки событий
+	unsubscribe     func()                          // функция отписки от Store
 	//
 	mu     sync.Mutex
 	ctx    context.Context
@@ -104,14 +118,15 @@ type SyncConfig struct {
 func NewSync(cfg *SyncConfig) (*Sync, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Sync{
-		store:       cfg.Store,
-		ripples:     cfg.Ripples,
-		logID:       cfg.LogID,
-		pending:     make(map[evstore.CID]*pendingRequest),
-		rateLimiter: rate.NewLimiter(RateLimitPerSecond, RateLimitBurst),
-		logger:      cfg.Logger.With().Str("component", "sync").Str("log", cfg.LogID).Logger(),
-		ctx:         ctx,
-		cancel:      cancel,
+		store:           cfg.Store,
+		ripples:         cfg.Ripples,
+		logID:           cfg.LogID,
+		pending:         make(map[evstore.CID]*pendingRequest),
+		pendingChildren: make(map[evstore.CID][]evstore.CID),
+		rateLimiter:     rate.NewLimiter(RateLimitPerSecond, RateLimitBurst),
+		logger:          cfg.Logger.With().Str("component", "sync").Str("log", cfg.LogID).Logger(),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
 	// Автоматическая подписка на новые события из Store
@@ -233,13 +248,33 @@ func (s *Sync) cleanupLoop() {
 					}
 				}
 			}
+
+			// Очистка pendingChildren для которых родитель так и не пришел
+			// Проверяем родителей которые находятся в pending больше TTL
+			childrenCleaned := 0
+			for parentCID := range s.pendingChildren {
+				if req, exists := s.pending[parentCID]; exists {
+					if now.Sub(req.requestedAt) > PendingTTL {
+						// Родитель в pending слишком долго - удаляем детей
+						childrenCleaned += len(s.pendingChildren[parentCID])
+						delete(s.pendingChildren, parentCID)
+					}
+				} else if !s.store.Has(parentCID) {
+					// Родитель не в pending и не в store - удаляем
+					childrenCleaned += len(s.pendingChildren[parentCID])
+					delete(s.pendingChildren, parentCID)
+				}
+			}
+
 			s.mu.Unlock()
 
-			if expired > 0 || failed > 0 {
+			if expired > 0 || failed > 0 || childrenCleaned > 0 {
 				s.logger.Debug().
 					Int("expired", expired).
 					Int("failed", failed).
 					Int("pending", len(s.pending)).
+					Int("pending_children_cleaned", childrenCleaned).
+					Int("pending_children", len(s.pendingChildren)).
 					Msg("cleanup pending")
 			}
 		}
