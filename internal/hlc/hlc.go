@@ -15,7 +15,6 @@ type Clock struct {
 	maxDiff time.Duration
 	pt      uint64 // physical time (μs)
 	lc      uint16 // logical counter
-	node    uint16 // node id для уникальности
 	now     func() uint64
 }
 
@@ -25,8 +24,8 @@ type Timestamp struct {
 	LC uint16 // logical counter
 }
 
-// TID - Timestamp Identifier (совместим с AT Protocol)
-// 64 бита: 53 бита timestamp (μs) + 10 бит clock + 1 бит reserved
+// TID - Timestamp Identifier
+// 64 бита: 53 бита timestamp (μs) + 11 бит random
 type TID uint64
 
 var (
@@ -40,22 +39,10 @@ const base32Alphabet = "234567abcdefghijklmnopqrstuvwxyz"
 
 // New создаёт новый HLC
 func New() *Clock {
-	var nodeID uint16
-	b := make([]byte, 2)
-	rand.Read(b)
-	nodeID = binary.BigEndian.Uint16(b) & 0x03FF // 10 бит
-
 	return &Clock{
 		maxDiff: 1 * time.Minute,
-		node:    nodeID,
 		now:     func() uint64 { return uint64(time.Now().UnixMicro()) },
 	}
-}
-
-// WithNodeID устанавливает ID узла (10 бит, 0-1023)
-func (c *Clock) WithNodeID(id uint16) *Clock {
-	c.node = id & 0x03FF
-	return c
 }
 
 // WithMaxDrift устанавливает максимально допустимое расхождение
@@ -95,8 +82,14 @@ func (c *Clock) TID() TID {
 		c.lc++
 	}
 
-	// 53 бита timestamp + 10 бит node + 1 бит reserved
-	return TID((c.pt << 11) | (uint64(c.node) << 1))
+	// Генерация случайных 11 бит
+	var rnd uint16
+	b := make([]byte, 2)
+	rand.Read(b)
+	rnd = binary.BigEndian.Uint16(b) & 0x07FF // 11 бит (0-2047)
+
+	// 53 бита timestamp + 11 бит random
+	return TID((c.pt << 11) | uint64(rnd))
 }
 
 // Update обновляет часы при получении сообщения
@@ -137,11 +130,13 @@ func (c *Clock) UpdateTID(tid TID) (TID, error) {
 		return 0, err
 	}
 
-	c.mu.Lock()
-	node := c.node
-	c.mu.Unlock()
+	// Генерация случайных 11 бит
+	var rnd uint16
+	b := make([]byte, 2)
+	rand.Read(b)
+	rnd = binary.BigEndian.Uint16(b) & 0x07FF // 11 бит (0-2047)
 
-	return TID((newTs.PT << 11) | (uint64(node) << 1)), nil
+	return TID((newTs.PT << 11) | uint64(rnd)), nil
 }
 
 // Timestamp возвращает текущее значение без инкремента
@@ -166,11 +161,6 @@ func (c *Clock) Set(ts Timestamp) error {
 	c.pt = ts.PT
 	c.lc = ts.LC
 	return nil
-}
-
-// NodeID возвращает ID узла
-func (c *Clock) NodeID() uint16 {
-	return c.node
 }
 
 // --- Timestamp методы ---
@@ -227,9 +217,9 @@ func (t TID) Timestamp() Timestamp {
 	}
 }
 
-// NodeID извлекает ID узла
-func (t TID) NodeID() uint16 {
-	return uint16((t >> 1) & 0x03FF)
+// Random извлекает случайные биты
+func (t TID) Random() uint16 {
+	return uint16(t & 0x07FF)
 }
 
 // Time возвращает время создания
@@ -301,11 +291,11 @@ func TIDFromBytes(b []byte) (TID, error) {
 // --- Утилиты ---
 
 // TIDFromTime создаёт TID из времени (для запросов по диапазону)
-func TIDFromTime(t time.Time, nodeID uint16) TID {
-	return TID((uint64(t.UnixMicro()) << 11) | (uint64(nodeID&0x03FF) << 1))
+func TIDFromTime(t time.Time, random uint16) TID {
+	return TID((uint64(t.UnixMicro()) << 11) | uint64(random&0x07FF))
 }
 
 // TIDRange возвращает границы для временного диапазона
 func TIDRange(from, to time.Time) (TID, TID) {
-	return TIDFromTime(from, 0), TIDFromTime(to, 0x03FF)
+	return TIDFromTime(from, 0), TIDFromTime(to, 0x07FF)
 }
