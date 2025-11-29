@@ -1,4 +1,4 @@
-package elog
+package evstore
 
 import "errors"
 

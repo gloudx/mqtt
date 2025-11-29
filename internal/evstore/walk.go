@@ -1,9 +1,7 @@
-// walk.go
-package elog
+package evstore
 
 import (
 	"bytes"
-	"mqtt-http-tunnel/internal/hlc"
 	"sort"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -161,40 +159,6 @@ func (s *Store) WalkHeads(fn func(cid CID, event *Event) error) error {
 		}
 	}
 	return nil
-}
-
-// get без блокировки (внутренний)
-func (s *Store) get(cid CID) (*Event, error) {
-	var event *Event
-
-	err := s.db.View(func(txn *badger.Txn) error {
-		indexKey := append(prefixCIDIndex, cid[:]...)
-		item, err := txn.Get(indexKey)
-		if err != nil {
-			return err
-		}
-
-		var tid hlc.TID
-		if err := item.Value(func(val []byte) error {
-			tid, _ = hlc.TIDFromBytes(val)
-			return nil
-		}); err != nil {
-			return err
-		}
-
-		eventKey := append(prefixEvents, tid.Bytes()...)
-		item, err = txn.Get(eventKey)
-		if err != nil {
-			return err
-		}
-
-		return item.Value(func(val []byte) error {
-			event, err = UnmarshalEvent(val)
-			return err
-		})
-	})
-
-	return event, err
 }
 
 func sortCIDs(cids []CID) {

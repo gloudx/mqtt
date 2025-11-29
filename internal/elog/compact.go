@@ -3,6 +3,23 @@ package elog
 
 import badger "github.com/dgraph-io/badger/v4"
 
+// Добавить в store.go метод Append с автокомпакцией
+
+// AppendWithCompact добавляет событие и компактит heads если нужно
+func (s *Store) AppendWithCompact(data []byte, compactThreshold int) (*Event, error) {
+	event, err := s.Append(data)
+	if err != nil {
+		return nil, err
+	}
+
+	// Heads автоматически = 1 после Append, но на всякий случай
+	if compactThreshold > 0 {
+		s.AutoCompact(compactThreshold)
+	}
+
+	return event, nil
+}
+
 // CompactHeads удаляет из heads те, которые являются ancestors других heads
 func (s *Store) CompactHeads() error {
 	s.mu.Lock()
@@ -75,30 +92,6 @@ func (s *Store) collectAncestors(cid CID, result map[CID]struct{}) {
 		result[p] = struct{}{}
 		s.collectAncestors(p, result)
 	}
-}
-
-// parents без блокировки
-func (s *Store) parents(cid CID) ([]CID, error) {
-	var parents []CID
-
-	err := s.db.View(func(txn *badger.Txn) error {
-		key := append(prefixDAG, cid[:]...)
-		item, err := txn.Get(key)
-		if err != nil {
-			return err
-		}
-
-		return item.Value(func(val []byte) error {
-			for i := 0; i+32 <= len(val); i += 32 {
-				var c CID
-				copy(c[:], val[i:i+32])
-				parents = append(parents, c)
-			}
-			return nil
-		})
-	})
-
-	return parents, err
 }
 
 // AutoCompact вызывает компакцию если heads > threshold

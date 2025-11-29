@@ -1,5 +1,4 @@
-// export.go
-package elog
+package evstore
 
 import (
 	"bufio"

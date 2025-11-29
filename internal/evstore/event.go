@@ -1,5 +1,4 @@
-// event.go
-package elog
+package evstore
 
 import (
 	"bytes"
