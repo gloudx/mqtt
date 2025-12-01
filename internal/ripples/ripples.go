@@ -213,14 +213,7 @@ func (r *Ripples) publish(cfg *Config) {
 	r.logger.Debug().Str("type", cfg.Type).Str("topic", topic).Msg("Published envelope")
 }
 
-// Send отправляет сообщение вручную (для разовых отправок)
-func (r *Ripples) Send(msgType, topic string, payload any) error {
-	r.mu.RLock()
-	cfg, exists := r.configs[msgType]
-	r.mu.RUnlock()
-	if !exists {
-		return fmt.Errorf("unknown message type: %s", msgType)
-	}
+func (r *Ripples) Broadcast(msgType string, payload any) error {
 	payloadData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
@@ -229,15 +222,15 @@ func (r *Ripples) Send(msgType, topic string, payload any) error {
 		ID:        fmt.Sprintf("%s-%d", r.ownerDID, time.Now().UnixNano()),
 		Type:      msgType,
 		FromDID:   r.ownerDID,
-		Timestamp: time.Now().UnixMilli(),
 		Payload:   payloadData,
+		Timestamp: time.Now().UnixMilli(),
 	}
 	data, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshal envelope: %w", err)
 	}
-	fullTopic := fmt.Sprintf("%s/%s", r.prefix, topic)
-	token := r.mqtt.Publish(fullTopic, cfg.QoS, false, data)
+	fullTopic := fmt.Sprintf("%s/%s", r.prefix, msgType)
+	token := r.mqtt.Publish(fullTopic, 1, false, data)
 	if token.Wait() && token.Error() != nil {
 		r.logger.Error().Err(token.Error()).Str("type", msgType).Str("topic", fullTopic).Msg("Failed to send")
 		return token.Error()

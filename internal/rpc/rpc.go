@@ -34,19 +34,23 @@ type Config struct {
 
 type Rpc struct {
 	mqtt           mqtt.Client
-	ownerDID       string
-	prefix         string
-	qos            byte
-	requestTimeout time.Duration
-	logger         zerolog.Logger
-	handlers       map[string]HandlerFunc
-	subscriptions  map[string]struct{} // отслеживание активных подписок
-	mu             sync.RWMutex
-	ctx            context.Context
-	cancel         context.CancelFunc
+	ownerDID       string         // cfg.OwnerDID
+	prefix         string         // cfg.Prefix
+	qos            byte           // cfg.QoS
+	requestTimeout time.Duration  // cfg.RequestTimeout
+	logger         zerolog.Logger // cfg.Logger
+	//
+	handlers      map[string]HandlerFunc
+	subscriptions map[string]struct{} // отслеживание активных подписок
+	//
+	mu     sync.RWMutex
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
+// New ...
 func New(mqttClient mqtt.Client, cfg *Config) (*Rpc, error) {
+
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -80,13 +84,16 @@ func New(mqttClient mqtt.Client, cfg *Config) (*Rpc, error) {
 		qos:            cfg.QoS,
 		requestTimeout: cfg.RequestTimeout,
 		logger:         cfg.Logger,
-		handlers:       make(map[string]HandlerFunc),
-		subscriptions:  make(map[string]struct{}),
-		ctx:            ctx,
-		cancel:         cancel,
+		//
+		handlers:      make(map[string]HandlerFunc),
+		subscriptions: make(map[string]struct{}),
+		//
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	c.logger.Info().Str("owner_did", c.ownerDID).Str("prefix", c.prefix).Msg("RPC initialized")
+
 	return c, nil
 }
 
@@ -157,6 +164,7 @@ func (c *Rpc) Call(ctx context.Context, targetDID, method string, params, result
 	}
 
 	responseTopic := fmt.Sprintf("%s/response/%s/%s/%s", c.prefix, c.ownerDID, method, requestID)
+
 	responseCh := make(chan Message, 1)
 
 	// Подписываемся ДО отправки запроса для предотвращения race condition
@@ -266,6 +274,7 @@ func (c *Rpc) handleRequest(msg *Message) {
 	}
 }
 
+// Close ...
 func (c *Rpc) Close() error {
 	c.logger.Info().Msg("RPC shutting down")
 
